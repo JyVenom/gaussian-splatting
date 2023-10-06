@@ -62,3 +62,9 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
+def bce_loss(network_output, gt):
+    bce = torch.nn.BCELoss()
+    return bce(network_output, gt)
+    # epsilon = 1e-15  # Small constant to avoid division by zero
+    # loss = - (gt * torch.log(network_output + epsilon) + (1 - gt) * torch.log(1 - network_output + epsilon))
+    # return torch.mean(loss)

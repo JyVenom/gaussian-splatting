@@ -11,7 +11,7 @@
 
 from scene.cameras import Camera
 import numpy as np
-from utils.general_utils import PILtoTorch
+from utils.general_utils import PILtoTorch, ArrayToTorch
 from utils.graphics_utils import fov2focal
 
 WARNED = False
@@ -39,8 +39,19 @@ def loadCam(args, id, cam_info, resolution_scale):
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+    if cam_info.depth is not None:
+        resized_depth_rgb = ArrayToTorch(cam_info.depth, resolution)
+    else:
+        resized_depth_rgb = None
 
     gt_image = resized_image_rgb[:3, ...]
+    if resized_depth_rgb is not None:
+        # depth_mask = resized_depth_rgb[0, ...] > 60000
+        gt_depth = resized_depth_rgb[0, ...]
+        # gt_depth[depth_mask] = 0
+    else:
+        gt_depth = None
+
     loaded_mask = None
 
     if resized_image_rgb.shape[1] == 4:
@@ -49,7 +60,7 @@ def loadCam(args, id, cam_info, resolution_scale):
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, gt_depth=gt_depth)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

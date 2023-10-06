@@ -4,5 +4,9 @@ output
 build
 diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
+simple-knn/simple_knn.egg-info
 tensorboard_3d
 screenshots
+.idea
+venv
+jerry_out/pcd.ply
