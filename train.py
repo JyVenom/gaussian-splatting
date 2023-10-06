@@ -114,6 +114,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #     from scipy.io import savemat
         #     savemat("jerry_out/gaussian_data.mat", {"means": gaussians.get_xyz.detach().cpu().numpy(), "scaling": gaussians.get_scaling.detach().cpu().numpy(), "rotation": gaussians.get_rotation.detach().cpu().numpy(), "opacity": gaussians.get_opacity.detach().cpu().numpy()})
         #     print("Wrote data to .mat")
+        #     print("Count:", gaussians.get_xyz.shape[0])
 
         # if iteration % 2000 == 0:
         #     # render_pkg2 = render_pkg

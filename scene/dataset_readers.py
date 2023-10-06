@@ -211,13 +211,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         contents = json.load(json_file)
         fovx = contents["camera_angle_x"]
 
-        is_test = 'test' in transformsfile
-
-        frames = contents["frames"][:49]
+        frames = contents["frames"]
         for idx, frame in enumerate(frames):
             cam_name = os.path.join(path, frame["file_path"] + extension)
 
-            depth_name = os.path.join(path, frame["file_path"] + "_depth_0000" + '.exr')
+            depth_name = os.path.join(path, frame["file_path"] + "_depth_0001" + '.exr')
 
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
