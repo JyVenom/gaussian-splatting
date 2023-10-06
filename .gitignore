@@ -9,4 +9,4 @@ tensorboard_3d
 screenshots
 .idea
 venv
-jerry_out/pcd.ply
+jerry_out
