@@ -63,6 +63,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # xyz_scheduler_args = get_expon_lr_func(lr_init=opt.position_lr_init * scene.cameras_extent, lr_final=opt.position_lr_final * scene.cameras_extent, lr_delay_mult=opt.position_lr_delay_mult, max_steps=opt.position_lr_max_steps)
     plt.rcParams.update({'font.size': 24})
 
+    color_losses, mask_losses, net_losses = [], [], []
+
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -114,7 +116,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #     from scipy.io import savemat
         #     savemat("jerry_out/gaussian_data.mat", {"means": gaussians.get_xyz.detach().cpu().numpy(), "scaling": gaussians.get_scaling.detach().cpu().numpy(), "rotation": gaussians.get_rotation.detach().cpu().numpy(), "opacity": gaussians.get_opacity.detach().cpu().numpy()})
         #     print("Wrote data to .mat")
-        #     print("Count:", gaussians.get_xyz.shape[0])
 
         # if iteration % 2000 == 0:
         #     # render_pkg2 = render_pkg
@@ -162,10 +163,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # color_losses.append(loss.detach().cpu().to(torch.float32).item())
         mask_loss = bce_loss(mask.squeeze(0), gt_mask)
+        # mask_losses.append(mask_loss.detach().cpu().to(torch.float32).item())
         beta = 0.9  # NOTE TO JERRY: THIS IS THE COLOR LOSS WEIGHT, SO KEEP IT HIGH!!!
         loss = beta * loss + (1 - beta) * mask_loss
+        # net_losses.append(loss.detach().cpu().to(torch.float32).item())
         loss.backward()
+
+        if iteration % 1000 == 0:
+        #     import plotly.express as px
+        #     import pandas as pd
+        #     df = pd.DataFrame({"Color Loss": color_losses, "Mask Loss": mask_losses, "Net Loss": net_losses})
+        #     fig = px.scatter(df, y=["Color Loss", "Mask Loss", "Net Loss"])
+        #     fig.show()
+            print(f"Loss Iter {iteration}: {loss}")
 
         iter_end.record()
 
@@ -205,7 +217,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-        if iteration % 15000 == 0:
+        if iteration % 30_000 == 0:
             print("Begin Depth to PCD to Mesh")
             def depth_image_to_point_cloud(depth_image, color_image, intrinsic_matrix, R, T):
                 fx, fy, cx, cy = intrinsic_matrix

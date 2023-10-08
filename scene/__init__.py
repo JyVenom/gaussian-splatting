@@ -40,6 +40,10 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
+        # Sanity Check/better warning
+        if not os.path.exists(args.source_path):
+            assert False, "Could not find dataset specified!"
+
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             print("Found sparse folder, assuming Colmap data set!")
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
