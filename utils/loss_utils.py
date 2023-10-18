@@ -13,6 +13,11 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+import numpy as np
+from sklearn.cluster import DBSCAN
+
+from sklearnex import patch_sklearn, config_context
+patch_sklearn()
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -68,3 +73,38 @@ def bce_loss(network_output, gt):
     # epsilon = 1e-15  # Small constant to avoid division by zero
     # loss = - (gt * torch.log(network_output + epsilon) + (1 - gt) * torch.log(1 - network_output + epsilon))
     # return torch.mean(loss)
+
+
+def depth_smoothness_loss(depth_map, image):
+    dx = torch.abs(depth_map[:, :, :-1] - depth_map[:, :, 1:])
+    dy = torch.abs(depth_map[:, :-1, :] - depth_map[:, 1:, :])
+
+    image_dx = torch.abs(image[:, :, :-1] - image[:, :, 1:])
+    image_dy = torch.abs(image[:, :-1, :] - image[:, 1:, :])
+
+    return torch.mean(dx * image_dx) + torch.mean(dy * image_dy)
+
+def dbscan_loss(penalty, data):
+    with config_context(target_offload="gpu:0"):
+        labels = DBSCAN(eps=0.15, min_samples=25, n_jobs=-1).fit_predict(data.detach().cpu().numpy())
+
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        largest_cluster_label = unique_labels[np.argmax(counts)]
+
+        cluster_penalty = (labels != largest_cluster_label).astype(np.float32)
+        cluster_penalty = torch.from_numpy(cluster_penalty).cuda()
+
+        return penalty * torch.mean(cluster_penalty)
+
+def dbscan_loss2(data):
+    data = data.detach().cpu().numpy()
+    with config_context(target_offload="gpu:0"):
+        labels = DBSCAN(eps=0.15, min_samples=25, n_jobs=-1).fit_predict(data)
+
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        largest_cluster_label = unique_labels[np.argmax(counts)]
+
+        T = torch.tensor(data[labels == largest_cluster_label], device="cuda")
+        S = torch.tensor(data, device="cuda")
+
+        return torch.cdist(S, T, p=2).min(dim=1).values.mean()

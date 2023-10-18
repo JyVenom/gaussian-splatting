@@ -20,6 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+import open3d as o3d
 
 
 class GaussianModel:
@@ -138,12 +139,27 @@ class GaussianModel:
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._scaling = nn.Parameter(scales.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
-        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(pcd.points)))
+        labels = np.array(pcd.cluster_dbscan(eps=0.15, min_points=25))
+        unique_labels, label_counts = np.unique(labels[labels >= 0], return_counts=True)
+        most_common_label = unique_labels[np.argmax(label_counts)]
+        mask2 = (labels == most_common_label)
+
+        # jerry_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(pcd.points)[mask2]))
+        # o3d.visualization.draw_geometries([jerry_pcd])
+
+        # mask2 = torch.randperm(fused_point_cloud.shape[0])[:40_000]
+
+        # pcd2 = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(pcd.points)[mask2]))
+        # pcd2.colors = o3d.utility.Vector3dVector(np.asarray(pcd.colors)[mask2])
+        # o3d.io.write_point_cloud("jerry_out/dbscan_pcd.ply", pcd2)
+
+        self._xyz = nn.Parameter(fused_point_cloud[mask2].requires_grad_(True))
+        self._features_dc = nn.Parameter(features[mask2][:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[mask2][:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales[mask2].requires_grad_(True))
+        self._rotation = nn.Parameter(rots[mask2].requires_grad_(True))
+        self._opacity = nn.Parameter(opacities[mask2].requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -353,7 +369,7 @@ class GaussianModel:
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
+                                                  torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
@@ -397,6 +413,7 @@ class GaussianModel:
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            # big_points_ws = torch.linalg.vector_norm(self.get_scaling, dim=1) > 0.2
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
@@ -407,3 +424,107 @@ class GaussianModel:
 
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def gaussian_3d_coeff(self, xyzs, covs):
+        # xyzs: [N, 3]
+        # covs: [N, 6]
+        x, y, z = xyzs[:, 0], xyzs[:, 1], xyzs[:, 2]
+        a, b, c, d, e, f = covs[:, 0], covs[:, 1], covs[:, 2], covs[:, 3], covs[:, 4], covs[:, 5]
+
+        # eps must be small enough !!!
+        inv_det = 1 / (a * d * f + 2 * e * c * b - e ** 2 * a - c ** 2 * d - b ** 2 * f + 1e-24)
+        inv_a = (d * f - e ** 2) * inv_det
+        inv_b = (e * c - b * f) * inv_det
+        inv_c = (e * b - c * d) * inv_det
+        inv_d = (a * f - c ** 2) * inv_det
+        inv_e = (b * c - e * a) * inv_det
+        inv_f = (a * d - b ** 2) * inv_det
+
+        power = -0.5 * (
+                    x ** 2 * inv_a + y ** 2 * inv_d + z ** 2 * inv_f) - x * y * inv_b - x * z * inv_c - y * z * inv_e
+
+        power[power > 0] = -1e10  # abnormal values... make weights 0
+
+        return torch.exp(power)
+
+    @torch.no_grad()
+    def extract_fields(self, resolution=128, num_blocks=16, relax_ratio=1.5):
+        # resolution: resolution of field
+
+        block_size = 2 / num_blocks
+
+        assert resolution % block_size == 0
+        split_size = resolution // num_blocks
+
+        opacities = self.get_opacity
+
+        # pre-filter low opacity gaussians to save computation
+        mask = (opacities > 0.005).squeeze(1)
+
+        opacities = opacities[mask]
+        xyzs = self.get_xyz[mask]
+        stds = self.get_scaling[mask]
+
+        # normalize to ~ [-1, 1]
+        mn, mx = xyzs.amin(0), xyzs.amax(0)
+        self.center = (mn + mx) / 2
+        self.scale = 1.8 / (mx - mn).amax().item()
+
+        xyzs = (xyzs - self.center) * self.scale
+        stds = stds * self.scale
+
+        covs = self.covariance_activation(stds, 1, self._rotation[mask])
+
+        # tile
+        device = opacities.device
+        occ = torch.zeros([resolution] * 3, dtype=torch.float32, device=device)
+
+        X = torch.linspace(-1, 1, resolution).split(split_size)
+        Y = torch.linspace(-1, 1, resolution).split(split_size)
+        Z = torch.linspace(-1, 1, resolution).split(split_size)
+
+        # loop blocks (assume max size of gaussian is small than relax_ratio * block_size !!!)
+        for xi, xs in enumerate(X):
+            for yi, ys in enumerate(Y):
+                for zi, zs in enumerate(Z):
+                    xx, yy, zz = torch.meshgrid(xs, ys, zs)
+                    # sample points [M, 3]
+                    pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1).to(device)
+                    # in-tile gaussians mask
+                    vmin, vmax = pts.amin(0), pts.amax(0)
+                    vmin -= block_size * relax_ratio
+                    vmax += block_size * relax_ratio
+                    mask = (xyzs < vmax).all(-1) & (xyzs > vmin).all(-1)
+                    # if hit no gaussian, continue to next block
+                    if not mask.any():
+                        continue
+                    mask_xyzs = xyzs[mask]  # [L, 3]
+                    mask_covs = covs[mask]  # [L, 6]
+                    mask_opas = opacities[mask].view(1, -1)  # [L, 1] --> [1, L]
+
+                    # query per point-gaussian pair.
+                    g_pts = pts.unsqueeze(1).repeat(1, mask_covs.shape[0], 1) - mask_xyzs.unsqueeze(0)  # [M, L, 3]
+                    g_covs = mask_covs.unsqueeze(0).repeat(pts.shape[0], 1, 1)  # [M, L, 6]
+
+                    # batch on gaussian to avoid OOM
+                    batch_g = 1024
+                    val = 0
+                    for start in range(0, g_covs.shape[1], batch_g):
+                        end = min(start + batch_g, g_covs.shape[1])
+                        w = self.gaussian_3d_coeff(g_pts[:, start:end].reshape(-1, 3), g_covs[:, start:end].reshape(-1, 6)).reshape(pts.shape[0], -1)  # [M, l]
+                        val += (mask_opas[:, start:end] * w).sum(-1)
+
+                    occ[xi * split_size: xi * split_size + len(xs),
+                    yi * split_size: yi * split_size + len(ys),
+                    zi * split_size: zi * split_size + len(zs)] = val.reshape(len(xs), len(ys), len(zs))
+
+        return occ
+
+    def extract_mesh(self, density_thresh=1, resolution=128):
+        occ = self.extract_fields(resolution).detach().cpu().numpy()
+
+        import mcubes
+        import trimesh
+        vertices, triangles = mcubes.marching_cubes(occ, density_thresh)
+        mesh = trimesh.Trimesh(vertices, triangles)
+        mesh.show()
