@@ -12,3 +12,4 @@ venv
 jerry_out
 data
 *.mat
+*.ply
