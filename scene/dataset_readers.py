@@ -85,13 +85,6 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         height = intr.height
         width = intr.width
 
-        # mat = np.zeros((4, 4))
-        # mat[:3, :3] = qvec2rotmat(extr.qvec)
-        # mat[:3, 3] = extr.tvec
-        # mat[3, 3] = 1.0
-        # mat = np.linalg.inv(mat)
-        # print(mat[:3, 3])
-
         uid = intr.id
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
@@ -111,28 +104,18 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
-        # img_num = int(extr.name[:-4])
+        img_num = int(extr.name[:-4])
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
-        depth_path = os.path.join(images_folder[:-6], "images_masked", os.path.basename(extr.name))
+        depth_path = os.path.join(images_folder[:-6], "masks", f"{img_num:03}.png")
         depth = Image.open(depth_path)
 
         width, height = 800, 800
         image = image.resize((width, height))
         depth = depth.resize((width, height))
-
-        depth = np.array(depth).astype(int)
-        image = np.array(image).astype(int)
-        depth = (np.abs(depth - image) > 4).astype(int).max(axis=-1).astype(bool)
-        image[depth] = 255
-        image = Image.fromarray(image.astype(np.uint8))
-        depth = (~depth).astype(int).astype(float)
-        # plt.imshow(np.array(image))
-        # plt.show()
-        # plt.imshow(depth, cmap='gray')
-        # plt.show()
+        depth = np.array(depth)
 
         if intr.model == "SIMPLE_RADIAL":  # dtu dataset, mask image
             mask = (depth == 0)

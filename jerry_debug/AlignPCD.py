@@ -3,7 +3,7 @@ import open3d as o3d
 
 
 def run():
-    gt = o3d.io.read_point_cloud("points3D_2.ply")
+    gt = o3d.io.read_point_cloud("points3D_4.ply")
     colmap = o3d.io.read_point_cloud("points3D.ply")
 
     points = np.asarray(colmap.points)

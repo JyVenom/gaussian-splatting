@@ -244,7 +244,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 15_000 == 0:
             print("Begin Depth to PCD to Mesh")
 
-            gaussians.extract_mesh(resolution=256)
+            # gaussians.extract_mesh(resolution=256)
 
             def depth_image_to_point_cloud(depth_image, color_image, intrinsic_matrix, R, T):
                 fx, fy, cx, cy = intrinsic_matrix

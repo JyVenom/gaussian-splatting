@@ -4,14 +4,11 @@ from scipy.spatial import KDTree
 
 
 def run():
-    neus = o3d.io.read_triangle_mesh("00300000_2.ply")
-    mine = o3d.io.read_triangle_mesh("spsr_mesh_2.ply")
-    gt = o3d.io.read_point_cloud("points3D_2.ply")
+    neus = o3d.io.read_triangle_mesh("neus_bird.ply")
+    mine = o3d.io.read_triangle_mesh("my_bird.ply")
+    gt = o3d.io.read_point_cloud("bird_gt.ply")
 
-    dist, _ = KDTree(gt).query(neus, k=1, workers=-1)
-
-
-    num_points = 100_000
+    num_points = 40_000
     neus = neus.sample_points_poisson_disk(number_of_points=num_points)
     mine = mine.sample_points_poisson_disk(number_of_points=num_points)
     mine.colors = o3d.utility.Vector3dVector(np.empty((0, 3)))
@@ -33,7 +30,7 @@ def run():
 
     # o3d.visualization.draw_geometries([neus])
     # o3d.visualization.draw_geometries([mine])
-    # o3d.visualization.draw_geometries([neus, mine, gt])
+    o3d.visualization.draw_geometries([neus, mine, gt])
 
     thresh = 0.5
     gt = np.asarray(gt.points)

@@ -13,3 +13,4 @@ jerry_out
 data
 *.mat
 *.ply
+*.npz
