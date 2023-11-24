@@ -10,7 +10,12 @@ screenshots
 .idea
 venv
 jerry_out
-data
+data/
 *.mat
 *.ply
 *.npz
+submodules/.
+submodules/
+*.h
+*.cu
+*.zip

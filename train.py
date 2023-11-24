@@ -19,6 +19,7 @@ from random import randint
 import numpy as np
 import open3d as o3d
 import torch
+import torch.nn.functional as F
 import trimesh
 from matplotlib import pyplot as plt
 from tqdm import tqdm
@@ -29,6 +30,11 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim, bce_loss, depth_smoothness_loss, dbscan_loss, dbscan_loss2
+from utils.sh_utils import RGB2SH
+from NeuS.fields import SDFNetwork, SingleVarianceNetwork
+from NeuS.dataset import Dataset
+
+from simple_knn._C import distCUDA2
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -38,11 +44,52 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
+def neus_sigma(xyz, sdf_network, deviation_network):
+    batch_size = 10_000
+    points = xyz.split(batch_size)
+
+    out_psdfs = []
+    a, b = 0, 0
+
+    for pts in points:
+        batch_size = pts.shape[0]
+
+        # pts = pts.requires_grad_(True)
+        sdf = sdf_network.sdf(pts)
+
+        inv_s = deviation_network().expand(batch_size, 1)
+        sig = (1 + torch.exp(-inv_s * sdf)).pow(-1)
+        # ldd = (inv_s * torch.exp(-inv_s * sdf)) / ((1 + torch.exp(-inv_s * sdf)).pow(2))
+        ldd = inv_s * sig * (1 - sig)
+        sigma = (ldd / sig / inv_s).reshape(batch_size, 1)
+        # sigma = (1-(torch.exp(-inv_s * sdf)/(1+torch.exp(-inv_s * sdf))))
+        # torch.nan_to_num(sigma)
+        # sigma[sigma.isnan()] = 0.0
+        # sigma = torch.where(torch.isnan(sigma), torch.zeros_like(sigma), sigma)
+
+        # Eikonal loss
+        gradients = sdf_network.gradient(pts).squeeze()
+        gradient_error = (torch.linalg.norm(gradients.reshape(batch_size, 3), ord=2, dim=-1) - 1.0) ** 2
+        pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size)
+        relax_inside_sphere = (pts_norm < 1.2).float()
+        a += (relax_inside_sphere * gradient_error).sum()
+        b += relax_inside_sphere.sum()
+
+        out_psdfs.append(sigma)
+
+        del sdf, sig, ldd, sigma, gradients, gradient_error, pts_norm, relax_inside_sphere
+
+    sigma = torch.cat(out_psdfs, dim=0)
+    gradient_error = a / (b + 1e-5)
+
+    return sigma, gradient_error
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+    gaussians.load_ply("data/dtu/dtu_scan24/init.ply")
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -59,7 +106,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    plt.rcParams.update({'font.size': 24})
+    sdf_network = SDFNetwork(d_out=257, d_in=3, d_hidden=256, n_layers=8, skip_in=[4], multires=6, bias=0.5, scale=1.0, geometric_init=True, weight_norm=True, ).to("cuda")
+    deviation_network = SingleVarianceNetwork(init_val=0.2).to("cuda")
+    # sdf_network.eval()
+    # deviation_network.eval()
+
+    checkpoint = torch.load(os.path.join(os.path.abspath(""), 'NeuS/checkpoints/ckpt_300000.pth'), map_location="cuda")
+    sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
+    # deviation_network.load_state_dict(checkpoint['variance_network_fine'])
+    neus = True
+    if neus:
+        optimizer_neus = torch.optim.Adam([*sdf_network.parameters(), *deviation_network.parameters()])
+
+    # neus_dataset = Dataset(data_dir="data/dtu/dtu_scan24/", render_cameras_name="cameras_sphere.npz", object_cameras_name="cameras_sphere.npz")
+
+    # plt.rcParams.update({'font.size': 24})
+
+    debug_wo_optimize = False
 
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -96,63 +159,153 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        mask = render_pkg["mask"]
+        if not neus or iteration == 1:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            mask = render_pkg["mask"]
 
-        # if iteration % 5000 == 0:
+##########################################################################################################################################
+        if neus:
+            if iteration > 1:
+                # sigma, eikonal_loss = neus_sigma(gaussians.get_xyz, sdf_network, deviation_network)
+                if debug_wo_optimize:
+                    # gaussians._psdf = sigma
+                    gaussians._psdf = torch.ones_like(gaussians._psdf)
+                else:
+                    # optimizable_tensors = gaussians.replace_tensor_to_optimizer(sigma, "psdf")
+                    # gaussians._psdf = optimizable_tensors["psdf"]
+                    optimizable_tensors = gaussians.replace_tensor_to_optimizer(torch.ones_like(gaussians._psdf), "psdf")
+                    gaussians._psdf = optimizable_tensors["psdf"]
+
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+                image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+                mask = render_pkg["mask"]
+
+                # if iteration == 1000:
+                #     depths3 = render_pkg["depth3"].detach().cpu().numpy()
+                #     psdf = render_pkg["psdf2"].detach().cpu().numpy()
+                #     opac = render_pkg["opac2"].detach().cpu().numpy()
+                #     alpha = render_pkg["alpha2"].detach().cpu().numpy()
+                #     pgaus = render_pkg["probs2"].detach().cpu().numpy()
+                #     s = deviation_network().item()
+                #     sdf = -np.log(psdf / (1 - psdf)) / s
+                #     weights = alpha * np.cumprod(np.concatenate([np.ones((1, 400, 400)), 1. - alpha + 1e-7], 0), 0)[:-1]
+                #     weight_sum = weights.cumsum(axis=0)
+                #
+                #     ray_num = (200, 200)
+                #     num = depths3[:, ray_num[0], ray_num[1]].argmin()
+                #     if num == 0 and depths3[0, ray_num[0], ray_num[1]] != 0:
+                #         num = depths3.shape[0]
+                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], opac[:num, ray_num[0], ray_num[1]], color='red')
+                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], alpha[:num, ray_num[0], ray_num[1]], color='blue')
+                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], psdf[:num, ray_num[0], ray_num[1]], color='green')
+                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], pgaus[:num, ray_num[0], ray_num[1]], color='orange')
+                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], sdf[:num, ray_num[0], ray_num[1]], color='violet')
+                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], weight_sum[:num, ray_num[0], ray_num[1]], color='indigo')
+                #     plt.legend(["opac", "alpha", "psdf (normalised eq, /=s)", "pgaus", "sdf", "weight sum"])
+                #     plt.show()
+                #
+                #     from scipy.io import savemat
+                #     savemat("new_eq_op_pg_ps_data_1123.mat", {"depths": depths3[:num, ray_num[0], ray_num[1]], "opac": opac[:num, ray_num[0], ray_num[1]], "alpha": alpha[:num, ray_num[0], ray_num[1]], "sdf": sdf[:num, ray_num[0], ray_num[1]], "psdf": psdf[:num, ray_num[0], ray_num[1]] / s, "pgaus": pgaus[:num, ray_num[0], ray_num[1]]})
+                #
+                #     pass
+
+            if iteration % 10000 == 0:
+                n, n2 = 256, 64
+                queries = np.concatenate([arr.reshape(-1, 1) for arr in np.meshgrid(*[np.linspace(-1, 1, num=n)] * 3, indexing="ij")], axis=1)
+                occ = np.zeros(0)
+                for i in range(0, n**3, n2**3):
+                    occ_batch = -sdf_network.sdf(torch.tensor(queries[i:i+n2**3], device='cuda').to(torch.float32)).detach().cpu().numpy()
+                    occ = np.concatenate((occ, occ_batch.squeeze()), axis=0)
+                occ = occ.reshape(n, n, n)
+                # occ = -sdf_network.sdf(torch.tensor(queries, device='cuda').to(torch.float32)).detach().cpu().numpy().reshape(n, n, n)
+                import mcubes
+                vertices, triangles = mcubes.marching_cubes(occ, 0.0)
+                vertices = vertices / (n - 1) * 2 - 1
+                mesh = trimesh.Trimesh(vertices, triangles)
+                mesh.show()
+##########################################################################################################################################
+
+        # if iteration % 5000 == 1:
+        #     render_pkg2 = render(all_cams[0], gaussians, pipe, background)
+        #     # render_pkg2 = render_pkg
+        #
         #     print(f"Num Gaussians Iter {iteration}: {gaussians.get_xyz.shape[0]}")
         #     from scipy.io import savemat
-        #     savemat("jerry_out/gaussian_data.mat", {"means": gaussians.get_xyz.detach().cpu().numpy(), "scaling": gaussians.get_scaling.detach().cpu().numpy(), "rotation": gaussians.get_rotation.detach().cpu().numpy(), "opacity": gaussians.get_opacity.detach().cpu().numpy()})
+        #     savemat("jerry_out/render_data.mat", {"points": render_pkg2["depth3"].detach().cpu().numpy(), "probs": render_pkg2["probs2"].detach().cpu().numpy(), "opacities": render_pkg2["opac2"].detach().cpu().numpy(), "color": render_pkg2["color2"].detach().cpu().numpy(), "gt": all_cams[0].original_image.detach().cpu().numpy()})
         #     print("Wrote data to .mat")
+        #
+        #     np.savez("jerry_out/render_data.npz", points=render_pkg2["depth3"].detach().cpu().numpy(), probs=render_pkg2["probs2"].detach().cpu().numpy(), opacity=render_pkg2["opac2"].detach().cpu().numpy(), color=render_pkg2["color2"].detach().cpu().numpy(), gt=all_cams[0].original_image.detach().cpu().numpy())
+        #     print("Wrote data to .npz")
+        #     return
 
-        if iteration % 500 == 0:
-            depth_img = render_pkg["depth2"].detach().cpu().numpy()[0].astype(np.float32)
+        # if iteration == 2:
+        #     all_cams = scene.getTrainCameras().copy()
+        #     fovxs, fovys, imgs, poses = [], [], [], []
+        #     for cam in all_cams:
+        #         mat = np.zeros((4, 4))
+        #         mat[:3, :3] = viewpoint_cam.R
+        #         mat[:3, 3] = viewpoint_cam.T
+        #         mat[3, 3] = 1.0
+        #         poses.append(mat)
+        #         imgs.append(cam.original_image.cpu().numpy())
+        #         fovxs.append(cam.FoVx)
+        #         fovys.append(cam.FoVy)
+        #
+        #     np.savez("dtu_scan24.npz", fovx=fovxs, fovy=fovys, images=imgs, poses=poses)
+        #     return
+
+        if iteration % 1000 == 2:
+            # depth_img = render_pkg["depth2"].detach().cpu().numpy()[0].astype(np.float32)
             mask_img = mask.detach().cpu().numpy()[0].astype(np.float32)
-            color_img = image.detach().cpu().numpy().astype(np.float32).transpose(1, 2, 0).clip(0., 1.)
-            depth_gt = (viewpoint_cam.depth.detach().cpu().numpy()).astype(np.float32)
+            color_img = image.detach().cpu().numpy().astype(np.float32).clip(0., 1.).transpose(1, 2, 0)
+            # color_img = image.T.reshape(100, 100, 3).detach().cpu().numpy().astype(np.float32).clip(0., 1.)
+            # depth_gt = (viewpoint_cam.depth.detach().cpu().numpy()).astype(np.float32)
             mask_gt = gt_mask.detach().cpu().numpy().astype(np.float32)
             color_gt = viewpoint_cam.original_image.detach().cpu().numpy().astype(np.float32).transpose(1, 2, 0)
 
+            # plt.imsave("jerry_out/est_depth.png", depth_img, cmap='gray')
             # plt.imsave("jerry_out/est_mask.png", mask_img, cmap='gray')
-            # plt.imsave("jerry_out/est_color.png", color_img)
+            plt.imsave("jerry_out/est_color.png", color_img)
 
-            fig, axs = plt.subplots(3, 2, figsize=(10, 16))
+            fig, axs = plt.subplots(2, 2, figsize=(10, 12))
             axs[0, 0].imshow(mask_gt, cmap='gray')
             axs[0, 0].set_title('GT Mask')
             axs[0, 0].axis('off')
             axs[0, 1].imshow(mask_img, cmap='gray')
             axs[0, 1].set_title('Estimated Mask')
             axs[0, 1].axis('off')
-            axs[1, 0].imshow(depth_gt, cmap='gray')
-            axs[1, 0].set_title('GT Depth')
+            axs[1, 0].imshow(color_gt)
+            axs[1, 0].set_title('GT Color')
             axs[1, 0].axis('off')
-            axs[1, 1].imshow(depth_img, cmap='gray')
-            axs[1, 1].set_title('Estimated Depth')
+            axs[1, 1].imshow(color_img)
+            axs[1, 1].set_title('Estimated Color')
             axs[1, 1].axis('off')
-            axs[2, 0].imshow(color_gt)
-            axs[2, 0].set_title('GT Color')
-            axs[2, 0].axis('off')
-            axs[2, 1].imshow(color_img)
-            axs[2, 1].set_title('Estimated Color')
-            axs[2, 1].axis('off')
             plt.tight_layout()
             plt.show()
+
+            torch.cuda.empty_cache()
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        mask_loss = bce_loss(mask.squeeze(0), gt_mask)
-        smoothness_loss = depth_smoothness_loss(render_pkg["depth2"], gt_image)
-        beta_1, beta_2 = 0.1, 0.1
-        assert (beta_1 + beta_2) <= 1, "Beta_1 and Beta_2 should not sum up to more than 1!"
-        loss = (1 - beta_1 - beta_2) * loss + beta_1 * mask_loss + beta_2 * smoothness_loss
-        loss.backward()
+        # mask_loss = bce_loss(mask.squeeze(), gt_mask)
+        # beta_1 = 0.1
+        # loss = 1 * loss + beta_1 * mask_loss
+        # if neus and iteration > 1:
+        #     loss = loss + eikonal_loss * 0.1
 
-        # if iteration % 1000 == 0:
-        #     print(f"Num Gaussians Iter {iteration}: {gaussians.get_xyz.shape[0]}")
-        #     # print(f"Max L2 Size: {torch.linalg.vector_norm(gaussians.get_scaling, dim=1).max()}")
+        if neus and iteration % 100 == 0:
+            print("Loss:", loss)
+            print("S:", deviation_network().clip(1e-6, 1e6))
+            print("# Gaussians:", gaussians.get_xyz.shape[0])
+
+        if not debug_wo_optimize:
+            loss.backward()
+
+        # if neus and iteration > 1:
+        #     sigma.backward(gaussians._opacity.grad)
 
         iter_end.record()
 
@@ -166,7 +319,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -174,72 +327,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, radii)
+                if not debug_wo_optimize:
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, radii)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and not debug_wo_optimize:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)  # gaussians.optimizer.zero_grad(set_to_none=True)
 
+                if iteration > 1000 and iteration % 100 == 0:
                     # Clustering
                     means = gaussians.get_xyz.detach().cpu().numpy()
                     pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means))
 
-                    labels = np.array(pcd.cluster_dbscan(eps=0.15, min_points=25))
+                    labels = np.array(pcd.cluster_dbscan(eps=0.1, min_points=25))
                     unique_labels, label_counts = np.unique(labels[labels >= 0], return_counts=True)
                     most_common_label = unique_labels[np.argmax(label_counts)]
                     gaussians.prune_points(labels != most_common_label)
+                    # print(f"DBSCAN Pruned {(labels != most_common_label).sum().item()} Gaussians")
 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                # if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                #     gaussians.reset_opacity()
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if (iteration < opt.iterations and not debug_wo_optimize) or iteration == 1:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
+
+                # if neus and iteration > 1:
+                #     # deviation_network.variance.grad /= gaussians.get_xyz.size(0)
+                #     optimizer_neus.step()
+                #     optimizer_neus.zero_grad(set_to_none=True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-        # if iteration % 5_000 == 0:
-        #     print("Draw Means")
-        #     means = gaussians.get_xyz.detach().cpu().numpy()
-        #     colors = gaussians.get_features[:, 0].detach().cpu().numpy()
-        #     pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means))
-        #     pcd.colors = o3d.utility.Vector3dVector(o3d.utility.Vector3dVector(colors))
-        #     o3d.visualization.draw_geometries([pcd])
-
-            # from scipy.spatial import Delaunay
-            # tri = Delaunay(means)
-            #
-            # max_triangle_size = 0.0001
-            # max_side_length = 0.1
-            #
-            # def tetrahedron_volume(tetra):
-            #     a, b, c, d = tetra
-            #     return np.abs(np.dot(a - d, np.cross(b - d, c - d))) / 6.0
-            #
-            # from scipy.spatial.distance import euclidean
-            #
-            # def tetrahedron_side_lengths(tetra):
-            #     a, b, c, d = tetra
-            #     return [euclidean(a, b), euclidean(a, c), euclidean(a, d), euclidean(b, c), euclidean(b, d),
-            #             euclidean(c, d)]
-            #
-            # tetrahedron_volumes = np.array([tetrahedron_volume(means[simplex]) for simplex in tri.simplices])
-            # tetrahedron_edges = np.array([tetrahedron_side_lengths(means[simplex]) for simplex in tri.simplices])
-            #
-            # mesh = trimesh.Trimesh(vertices=means, faces=tri.simplices[(tetrahedron_volumes <= max_triangle_size) & (np.max(tetrahedron_edges, axis=1) <= max_side_length)])
-            # mesh.show()
-            #
-            # print("Begin DBSCAN")
-            # labels = np.array(pcd.cluster_dbscan(eps=0.15, min_points=25, print_progress=True))
-            # unique_labels, label_counts = np.unique(labels, return_counts=True)
-            # most_common_index = np.argmax(label_counts)
-            # most_common_label = unique_labels[most_common_index]
-            # pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means[labels == most_common_label]))
-            # pcd.colors = o3d.utility.Vector3dVector(o3d.utility.Vector3dVector(colors[labels == most_common_label]))
-            # o3d.visualization.draw_geometries([pcd])
+        if iteration % 2_000 == 0:
+            print("Draw Means")
+            means = gaussians.get_xyz.detach().cpu().numpy()
+            colors = gaussians.get_features[:, 0].detach().cpu().numpy()
+            pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means))
+            pcd.colors = o3d.utility.Vector3dVector(o3d.utility.Vector3dVector(colors))
+            o3d.visualization.draw_geometries([pcd])
 
         if iteration % 15_000 == 0:
             print("Begin Depth to PCD to Mesh")
@@ -254,7 +383,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 for i in range(height):
                     for j in range(width):
                         z = depth_image[i][j]
-                        if z > 2:
+                        if z > 0:
                             x = (j - cx) * z / fx
                             y = (i - cy) * z / fy
                             pcd.append([x, y, z])
@@ -265,9 +394,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 return pcd, np.array(colors)
 
-            # Get camera intrinsics (shared)
             def fov2focal(fov, pixels):
                 return pixels / (2 * math.tan(fov / 2))
+
             intrinsic_matrix = np.array([fov2focal(viewpoint_cam.FoVx, viewpoint_cam.image_width), fov2focal(viewpoint_cam.FoVy, viewpoint_cam.image_height), viewpoint_cam.image_width / 2, viewpoint_cam.image_height / 2])
 
             points = np.empty((0, 3))
@@ -317,71 +446,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
             pcd.normals = o3d.utility.Vector3dVector(normals)
             pcd.colors = o3d.utility.Vector3dVector(colors)
-            pcd, _ = pcd.remove_statistical_outlier(50, 1.5)
+            pcd, _ = pcd.remove_statistical_outlier(100, 1.25)
             o3d.visualization.draw_geometries([pcd])
             o3d.io.write_point_cloud("jerry_out/pcd.ply", pcd)
 
             # To mesh (SPSR)
-            # pcd.orient_normals_consistent_tangent_plane(15)
-            # o3d.io.write_point_cloud("jerry_out/pcd_with_normals.ply", pcd)
-            # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
-            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd)
+            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
             mesh.compute_vertex_normals()
-            mesh = mesh.filter_smooth_simple(number_of_iterations=5)
+            # mesh = mesh.filter_smooth_simple(number_of_iterations=3)
             o3d.visualization.draw_geometries([mesh])
             o3d.io.write_triangle_mesh("jerry_out/spsr_mesh.ply", mesh)
-
-            # # Marching Cubes
-            # def qvec2rotmat(qvec):
-            #     return np.array([
-            #         [1 - 2 * qvec[2] ** 2 - 2 * qvec[3] ** 2,
-            #          2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
-            #          2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2]],
-            #         [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
-            #          1 - 2 * qvec[1] ** 2 - 2 * qvec[3] ** 2,
-            #          2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1]],
-            #         [2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
-            #          2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
-            #          1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2]])
-            #
-            # def pdf_3d_gaussian(p, mean, inv, det):
-            #     d = p - mean
-            #     return det * np.exp(-0.5 * (d.T @ inv @ d))
-            #
-            #
-            # means = gaussians.get_xyz.detach().cpu().numpy()
-            # alphas = gaussians.get_opacity.detach().cpu().numpy()
-            # rots = gaussians.get_rotation.detach().cpu().numpy()
-            # rotation_matrices = np.array([qvec2rotmat(qvec) for qvec in rots])
-            # scaling = gaussians.get_scaling.detach().cpu().numpy()
-            # scaling_matrices = np.array([np.diag(scale ** 2) for scale in scaling])
-            # covariance_matrices = []
-            # for rot_mat, sc_mat in tqdm(zip(rotation_matrices, scaling_matrices)):
-            #     covariance_matrices.append(rot_mat @ sc_mat @ rot_mat.T)
-            # covariance_matrices = np.array(covariance_matrices)
-            # invs = np.array([np.linalg.inv(cov_mat) for cov_mat in covariance_matrices])
-            # dets = np.array([(1 / np.sqrt((2 * np.pi) ** 3 * np.linalg.det(cov_mat))) for cov_mat in covariance_matrices])
-            # np.savez("jerry_debug/data_5000.npz", means=means, alphas=alphas, inv=invs, det=dets)
-            #
-            # minn, maxx = means.min(axis=0), means.max(axis=0)
-            # print(minn, maxx)
-            # dist = 1.1 * (maxx - minn).max()
-            # corner1, corner2 = (minn + maxx) / 2 - dist / 2, (minn + maxx) / 2 + dist / 2
-            # n = 128
-            # queries = np.concatenate([arr.reshape(-1, 1) for arr in np.meshgrid(*[np.linspace(corner1, corner2, num=n)] * 3, indexing="ij")], axis=1)
-            #
-            # occ = np.zeros((n**3, 1))
-            # for i, query in tqdm(enumerate(queries)):
-            #     for j, mean in enumerate(means):
-            #         occ[i, 0] += pdf_3d_gaussian(query, mean, invs[j], dets[j]) * alphas[j]
-            #
-            # occ = occ.reshape(n, n, n)
-            # import mcubes
-            # vertices, triangles = mcubes.marching_cubes(occ, 0.5)
-            # mesh = trimesh.Trimesh(vertices, triangles)
-            # mesh.show()
-            # # mesh.export("mcubes_mesh.ply")
-
 
     print("Final # of gaussians:", gaussians._xyz.size(0))
 
@@ -445,127 +519,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
-def to_mesh(my_reconstruction):
-    # Shorthand
-    occ = my_reconstruction
-
-    # Shape of voxel grid
-    nx, ny, nz = occ.shape
-    # Shape of corresponding occupancy grid
-    grid_shape = (nx + 1, ny + 1, nz + 1)
-
-    # Convert values to occupancies
-    occ = np.pad(occ, 1, 'constant')
-
-    # Determine if face present
-    f1_r = (occ[:-1, 1:-1, 1:-1] & ~occ[1:, 1:-1, 1:-1])
-    f2_r = (occ[1:-1, :-1, 1:-1] & ~occ[1:-1, 1:, 1:-1])
-    f3_r = (occ[1:-1, 1:-1, :-1] & ~occ[1:-1, 1:-1, 1:])
-
-    f1_l = (~occ[:-1, 1:-1, 1:-1] & occ[1:, 1:-1, 1:-1])
-    f2_l = (~occ[1:-1, :-1, 1:-1] & occ[1:-1, 1:, 1:-1])
-    f3_l = (~occ[1:-1, 1:-1, :-1] & occ[1:-1, 1:-1, 1:])
-
-    f1 = f1_r | f1_l
-    f2 = f2_r | f2_l
-    f3 = f3_r | f3_l
-
-    assert (f1.shape == (nx + 1, ny, nz))
-    assert (f2.shape == (nx, ny + 1, nz))
-    assert (f3.shape == (nx, ny, nz + 1))
-
-    # Determine if vertex present
-    v = np.full(grid_shape, False)
-
-    v[:, :-1, :-1] |= f1
-    v[:, :-1, 1:] |= f1
-    v[:, 1:, :-1] |= f1
-    v[:, 1:, 1:] |= f1
-
-    v[:-1, :, :-1] |= f2
-    v[:-1, :, 1:] |= f2
-    v[1:, :, :-1] |= f2
-    v[1:, :, 1:] |= f2
-
-    v[:-1, :-1, :] |= f3
-    v[:-1, 1:, :] |= f3
-    v[1:, :-1, :] |= f3
-    v[1:, 1:, :] |= f3
-
-    # Calculate indices for vertices
-    n_vertices = v.sum()
-    v_idx = np.full(grid_shape, -1)
-    v_idx[v] = np.arange(n_vertices)
-
-    # Vertices
-    v_x, v_y, v_z = np.where(v)
-    v_x = v_x / nx - 0.5
-    v_y = v_y / ny - 0.5
-    v_z = v_z / nz - 0.5
-    vertices = np.stack([v_x, v_y, v_z], axis=1)
-
-    # Face indices
-    f1_l_x, f1_l_y, f1_l_z = np.where(f1_l)
-    f2_l_x, f2_l_y, f2_l_z = np.where(f2_l)
-    f3_l_x, f3_l_y, f3_l_z = np.where(f3_l)
-
-    f1_r_x, f1_r_y, f1_r_z = np.where(f1_r)
-    f2_r_x, f2_r_y, f2_r_z = np.where(f2_r)
-    f3_r_x, f3_r_y, f3_r_z = np.where(f3_r)
-
-    faces_1_l = np.stack([
-        v_idx[f1_l_x, f1_l_y, f1_l_z],
-        v_idx[f1_l_x, f1_l_y, f1_l_z + 1],
-        v_idx[f1_l_x, f1_l_y + 1, f1_l_z + 1],
-        v_idx[f1_l_x, f1_l_y + 1, f1_l_z],
-    ], axis=1)
-
-    faces_1_r = np.stack([
-        v_idx[f1_r_x, f1_r_y, f1_r_z],
-        v_idx[f1_r_x, f1_r_y + 1, f1_r_z],
-        v_idx[f1_r_x, f1_r_y + 1, f1_r_z + 1],
-        v_idx[f1_r_x, f1_r_y, f1_r_z + 1],
-    ], axis=1)
-
-    faces_2_l = np.stack([
-        v_idx[f2_l_x, f2_l_y, f2_l_z],
-        v_idx[f2_l_x + 1, f2_l_y, f2_l_z],
-        v_idx[f2_l_x + 1, f2_l_y, f2_l_z + 1],
-        v_idx[f2_l_x, f2_l_y, f2_l_z + 1],
-    ], axis=1)
-
-    faces_2_r = np.stack([
-        v_idx[f2_r_x, f2_r_y, f2_r_z],
-        v_idx[f2_r_x, f2_r_y, f2_r_z + 1],
-        v_idx[f2_r_x + 1, f2_r_y, f2_r_z + 1],
-        v_idx[f2_r_x + 1, f2_r_y, f2_r_z],
-    ], axis=1)
-
-    faces_3_l = np.stack([
-        v_idx[f3_l_x, f3_l_y, f3_l_z],
-        v_idx[f3_l_x, f3_l_y + 1, f3_l_z],
-        v_idx[f3_l_x + 1, f3_l_y + 1, f3_l_z],
-        v_idx[f3_l_x + 1, f3_l_y, f3_l_z],
-    ], axis=1)
-
-    faces_3_r = np.stack([
-        v_idx[f3_r_x, f3_r_y, f3_r_z],
-        v_idx[f3_r_x + 1, f3_r_y, f3_r_z],
-        v_idx[f3_r_x + 1, f3_r_y + 1, f3_r_z],
-        v_idx[f3_r_x, f3_r_y + 1, f3_r_z],
-    ], axis=1)
-
-    faces = np.concatenate([
-        faces_1_l, faces_1_r,
-        faces_2_l, faces_2_r,
-        faces_3_l, faces_3_r,
-    ], axis=0)
-
-    # vertices = self.loc + self.scale * vertices
-    mesh = trimesh.Trimesh(vertices, faces, process=False)
-    return mesh
-
 if __name__ == "__main__":
+    # torch.set_default_device('cuda')
     # torch.manual_seed(0)
 
     # Set up command line argument parser

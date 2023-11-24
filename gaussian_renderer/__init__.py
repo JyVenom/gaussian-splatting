@@ -53,6 +53,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    psdf = pc.get_psdf
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -82,12 +83,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, depth, depth2, alphas, depths3 = rasterizer(
+    rendered_image, radii, depth, probs2, color2, opac2, depth3, alpha2, psdf2 = rasterizer(
         means3D = means3D,
         means2D = means2D,
+        opacities = opacity,
+        psdf = psdf,
         shs = shs,
         colors_precomp = colors_precomp,
-        opacities = opacity,
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
@@ -99,6 +101,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "visibility_filter": radii > 0,
             "radii": radii,
             "mask": depth,
-            "depth2": depth2,
-            "alphas": alphas,
-            "depths3": depths3}
+            # "depth2": depth2,
+            "depth3": depth3,
+            "probs2": probs2,
+            "color2": color2,
+            "opac2": opac2,
+            "alpha2": alpha2,
+            "psdf2": psdf2}

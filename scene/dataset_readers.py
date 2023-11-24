@@ -27,7 +27,7 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 import matplotlib.pyplot as plt
-import cv2 as cv
+import cv2
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -112,7 +112,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         depth_path = os.path.join(images_folder[:-6], "masks", f"{img_num:03}.png")
         depth = Image.open(depth_path)
 
-        width, height = 800, 800
+        width, height = 400, 400
         image = image.resize((width, height))
         depth = depth.resize((width, height))
         depth = np.array(depth)
@@ -231,8 +231,16 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
 
+            # Resize
+            width, height = 100, 100
+            image = image.resize((width, height))
+
             exr_data = pyexr.open(depth_name)
             depth = exr_data.get()[..., 0]
+
+            depth = Image.fromarray(depth)
+            depth = depth.resize((width, height))
+            depth = np.array(depth)
 
             depth[depth > 60000] = 0
             depth = (depth > 0.01).astype(np.float32)
@@ -294,20 +302,18 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
-def load_K_Rt_from_P(filename, P=None):
-    if P is None:
-        lines = open(filename).read().splitlines()
-        if len(lines) == 4:
-            lines = lines[1:]
-        lines = [[x[0], x[1], x[2], x[3]] for x in (x.split(" ") for x in lines)]
-        P = np.asarray(lines).astype(np.float32).squeeze()
-
-    out = cv.decomposeProjectionMatrix(P)
+def load_K_Rt_from_P(P):
+    out = cv2.decomposeProjectionMatrix(P)
     K = out[0]
     R = out[1]
     t = out[2]
 
-    return K / K[2, 2], R, (t[:3] / t[3])[:, 0]
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = R.transpose()
+    pose[:3, 3] = (t[:3] / t[3])[:, 0]
+    pose = np.linalg.inv(pose)
+
+    return K / K[2, 2], pose
 
 def readCamerasFromNpz(path, mask_img):
     camera_dict = np.load(os.path.join(path, "cameras_sphere.npz"))
@@ -320,55 +326,48 @@ def readCamerasFromNpz(path, mask_img):
     masks = sorted(glob(os.path.join(path, 'mask/*.png')))
 
     cam_infos = []
-
     for idx, (scale_mat, world_mat) in enumerate(zip(scale_mats_np, world_mats_np)):
+        sys.stdout.write('\r')
+        sys.stdout.write("Reading camera {}/{}".format(idx+1, n_img))
+        sys.stdout.flush()
+
         P = world_mat @ scale_mat
         P = P[:3, :4]
-        intrinsics, R, T = load_K_Rt_from_P(None, P)
-        R = R[:, [2, 1, 0]]
-        T[0], T[2] = T[2], T[0]
+        intrinsics, pose = load_K_Rt_from_P(P)
+
+        R = pose[:3, :3].transpose()
+        T = pose[:3, 3]
 
         image_path = imgs[idx]
         image_name = Path(image_path).stem
         image = Image.open(image_path)
+        depth = Image.open(masks[idx])
 
         width, height = image.size
-
         FovX = focal2fov(intrinsics[0, 0], width)
         FovY = focal2fov(intrinsics[1, 1], height)
 
-        depth = Image.open(masks[idx])
-
-        mat = np.zeros((4, 4))
-        mat[3, 3] = 1.0
-        mat[:3, :3] = R.transpose()
-        mat[:3, 3] = T
-        mat = np.linalg.inv(mat)
-        R = mat[:3, :3]
-        T = mat[:3, 3]
-
         # Resize
-        # width = width // 2
-        # height = height // 2
-        width, height = 800, 800
+        width, height = 400, 400
         image = image.resize((width, height))
         depth = depth.resize((width, height))
         depth = np.array(depth)
 
         # If mask image
-        if mask_img:
-            mask = (depth == 0)
-            im_data = np.array(image)
-            im_data[mask] = 255
-            image = Image.fromarray(im_data)
+        fill = 255 if mask_img else 0
+        mask = (depth == [0, 0, 0]).any(axis=-1)
+        im_data = np.array(image)
+        im_data[mask] = fill
+        image = Image.fromarray(im_data)
 
         cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                                     image_path=image_path, image_name=image_name, width=width, height=height, depth=depth))
 
+    sys.stdout.write('\n')
     return cam_infos
 
 def readDTUInfo(path, white_background, eval):
-    assert eval, "eval is false, I (Jerry) don't know how to handle that yet, or even what it means."
+    assert not eval, "eval is true, I have not implemented 7/1 split yet."
 
     train_cam_infos = readCamerasFromNpz(path, white_background)
 
@@ -380,10 +379,10 @@ def readDTUInfo(path, white_background, eval):
         num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
 
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        # We create random points inside the bounds of the DTU scenes
+        xyz = np.random.random((num_pts, 3)) * 2.2 - 1.1
         shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+        # pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
 
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:

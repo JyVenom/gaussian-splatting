@@ -36,7 +36,7 @@ def create_window(window_size, channel):
     return window
 
 def ssim(img1, img2, window_size=11, size_average=True):
-    channel = img1.size(-3)
+    channel = img1.size(0)
     window = create_window(window_size, channel)
 
     if img1.is_cuda:
