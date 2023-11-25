@@ -254,6 +254,7 @@ class GaussianModel:
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])), axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        psdf = np.asarray(plydata.elements[0]["psdf"])[..., np.newaxis]
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -284,9 +285,11 @@ class GaussianModel:
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity = nn.Parameter(torch.zeros(opacities.shape, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
+        # self._opacity = nn.Parameter(torch.zeros(opacities.shape, dtype=torch.float, device="cuda").requires_grad_(True))
         # self._opacity = torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True)
-        self._psdf = nn.Parameter(torch.ones(opacities.shape, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._psdf = nn.Parameter(torch.tensor(psdf, dtype=torch.float, device="cuda").requires_grad_(True))
+        # self._psdf = nn.Parameter(torch.ones(opacities.shape, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 

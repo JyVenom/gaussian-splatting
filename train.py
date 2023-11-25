@@ -61,7 +61,7 @@ def neus_sigma(xyz, sdf_network, deviation_network):
         sig = (1 + torch.exp(-inv_s * sdf)).pow(-1)
         # ldd = (inv_s * torch.exp(-inv_s * sdf)) / ((1 + torch.exp(-inv_s * sdf)).pow(2))
         ldd = inv_s * sig * (1 - sig)
-        sigma = (ldd / sig / inv_s).reshape(batch_size, 1)
+        sigma = (ldd / sig / inv_s * 2).reshape(batch_size, 1)
         # sigma = (1-(torch.exp(-inv_s * sdf)/(1+torch.exp(-inv_s * sdf))))
         # torch.nan_to_num(sigma)
         # sigma[sigma.isnan()] = 0.0
@@ -89,7 +89,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
-    gaussians.load_ply("data/dtu/dtu_scan24/init.ply")
+    gaussians.load_ply("data/dtu/dtu_scan24/init_3000.ply")
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -107,7 +107,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
 
     sdf_network = SDFNetwork(d_out=257, d_in=3, d_hidden=256, n_layers=8, skip_in=[4], multires=6, bias=0.5, scale=1.0, geometric_init=True, weight_norm=True, ).to("cuda")
-    deviation_network = SingleVarianceNetwork(init_val=0.2).to("cuda")
+    deviation_network = SingleVarianceNetwork(init_val=0.55).to("cuda")
     # sdf_network.eval()
     # deviation_network.eval()
 
@@ -167,48 +167,59 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 ##########################################################################################################################################
         if neus:
             if iteration > 1:
-                # sigma, eikonal_loss = neus_sigma(gaussians.get_xyz, sdf_network, deviation_network)
+                sigma, eikonal_loss = neus_sigma(gaussians.get_xyz, sdf_network, deviation_network)
                 if debug_wo_optimize:
-                    # gaussians._psdf = sigma
-                    gaussians._psdf = torch.ones_like(gaussians._psdf)
+                    gaussians._psdf = sigma
+                    # gaussians._psdf = torch.ones_like(gaussians._psdf)
                 else:
-                    # optimizable_tensors = gaussians.replace_tensor_to_optimizer(sigma, "psdf")
-                    # gaussians._psdf = optimizable_tensors["psdf"]
-                    optimizable_tensors = gaussians.replace_tensor_to_optimizer(torch.ones_like(gaussians._psdf), "psdf")
+                    optimizable_tensors = gaussians.replace_tensor_to_optimizer(sigma, "psdf")
                     gaussians._psdf = optimizable_tensors["psdf"]
+                    # optimizable_tensors = gaussians.replace_tensor_to_optimizer(torch.ones_like(gaussians._psdf), "psdf")
+                    # gaussians._psdf = optimizable_tensors["psdf"]
 
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background)
                 image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
                 mask = render_pkg["mask"]
 
-                # if iteration == 1000:
-                #     depths3 = render_pkg["depth3"].detach().cpu().numpy()
-                #     psdf = render_pkg["psdf2"].detach().cpu().numpy()
-                #     opac = render_pkg["opac2"].detach().cpu().numpy()
-                #     alpha = render_pkg["alpha2"].detach().cpu().numpy()
-                #     pgaus = render_pkg["probs2"].detach().cpu().numpy()
-                #     s = deviation_network().item()
-                #     sdf = -np.log(psdf / (1 - psdf)) / s
-                #     weights = alpha * np.cumprod(np.concatenate([np.ones((1, 400, 400)), 1. - alpha + 1e-7], 0), 0)[:-1]
-                #     weight_sum = weights.cumsum(axis=0)
-                #
-                #     ray_num = (200, 200)
-                #     num = depths3[:, ray_num[0], ray_num[1]].argmin()
-                #     if num == 0 and depths3[0, ray_num[0], ray_num[1]] != 0:
-                #         num = depths3.shape[0]
-                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], opac[:num, ray_num[0], ray_num[1]], color='red')
-                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], alpha[:num, ray_num[0], ray_num[1]], color='blue')
-                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], psdf[:num, ray_num[0], ray_num[1]], color='green')
-                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], pgaus[:num, ray_num[0], ray_num[1]], color='orange')
-                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], sdf[:num, ray_num[0], ray_num[1]], color='violet')
-                #     plt.plot(depths3[:num, ray_num[0], ray_num[1]], weight_sum[:num, ray_num[0], ray_num[1]], color='indigo')
-                #     plt.legend(["opac", "alpha", "psdf (normalised eq, /=s)", "pgaus", "sdf", "weight sum"])
-                #     plt.show()
-                #
-                #     from scipy.io import savemat
-                #     savemat("new_eq_op_pg_ps_data_1123.mat", {"depths": depths3[:num, ray_num[0], ray_num[1]], "opac": opac[:num, ray_num[0], ray_num[1]], "alpha": alpha[:num, ray_num[0], ray_num[1]], "sdf": sdf[:num, ray_num[0], ray_num[1]], "psdf": psdf[:num, ray_num[0], ray_num[1]] / s, "pgaus": pgaus[:num, ray_num[0], ray_num[1]]})
-                #
-                #     pass
+                if iteration % 3000 == 0:
+                    depths3 = render_pkg["depth3"].detach().cpu().numpy()
+                    psdf = render_pkg["psdf2"].detach().cpu().numpy()
+                    opac = render_pkg["opac2"].detach().cpu().numpy()
+                    alpha = render_pkg["alpha2"].detach().cpu().numpy()
+                    pgaus = render_pkg["probs2"].detach().cpu().numpy()
+                    s = deviation_network().item()
+                    sdf = -np.log(psdf / (2 - psdf))/s
+                    weights = alpha * np.cumprod(np.concatenate([np.ones((1, 400, 400)), 1. - alpha + 1e-7], 0), 0)[:-1]
+                    weight_sum = weights.cumsum(axis=0)
+
+                    print("View #", viewpoint_cam.image_name)
+
+                    # rays = np.concatenate([arr.reshape(-1, 1) for arr in np.meshgrid(*[np.arange(196, 205, 2)] * 2, indexing="ij")], axis=1).astype(int)
+                    # for ray_num in rays:
+                    ray_num = (200, 200)
+                    num = depths3[:, ray_num[0], ray_num[1]].argmin()
+                    if num == 0 and depths3[0, ray_num[0], ray_num[1]] != 0:
+                        num = depths3.shape[0]
+                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], opac[:num, ray_num[0], ray_num[1]], color='red')
+                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], alpha[:num, ray_num[0], ray_num[1]], 'b*')
+                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], psdf[:num, ray_num[0], ray_num[1]], color='green')
+                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], pgaus[:num, ray_num[0], ray_num[1]], color='orange')
+                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], sdf[:num, ray_num[0], ray_num[1]] * 10, color='violet')
+                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], weight_sum[:num, ray_num[0], ray_num[1]], color='indigo')
+                    plt.legend(["opac", "alpha", "psdf (normalised eq, /=s)", "pgaus", "sdf x10", "weight sum"])
+                    plt.show()
+
+                    # def fov2focal(fov, pixels):
+                    #     return pixels / (2 * math.tan(fov / 2))
+                    # intrinsic_matrix = np.array([fov2focal(viewpoint_cam.FoVx, viewpoint_cam.image_width), fov2focal(viewpoint_cam.FoVy, viewpoint_cam.image_height), viewpoint_cam.image_width / 2, viewpoint_cam.image_height / 2])
+                    #
+                    # gpsdf = gaussians.get_psdf.detach().cpu().numpy()
+                    # gsdf = -np.log(gpsdf / (2 - gpsdf)) / s
+                    #
+                    # from scipy.io import savemat
+                    # savemat("gaus_ray_data.mat", {"mean": gaussians.get_xyz.detach().cpu().numpy(), "scaling": gaussians.get_scaling.detach().cpu().numpy(), "rotation": gaussians.get_rotation.detach().cpu().numpy(), "sdf": gsdf, "intrinsics": intrinsic_matrix})
+
+                    pass
 
             if iteration % 10000 == 0:
                 n, n2 = 256, 64
@@ -226,36 +237,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 mesh.show()
 ##########################################################################################################################################
 
-        # if iteration % 5000 == 1:
-        #     render_pkg2 = render(all_cams[0], gaussians, pipe, background)
-        #     # render_pkg2 = render_pkg
-        #
-        #     print(f"Num Gaussians Iter {iteration}: {gaussians.get_xyz.shape[0]}")
-        #     from scipy.io import savemat
-        #     savemat("jerry_out/render_data.mat", {"points": render_pkg2["depth3"].detach().cpu().numpy(), "probs": render_pkg2["probs2"].detach().cpu().numpy(), "opacities": render_pkg2["opac2"].detach().cpu().numpy(), "color": render_pkg2["color2"].detach().cpu().numpy(), "gt": all_cams[0].original_image.detach().cpu().numpy()})
-        #     print("Wrote data to .mat")
-        #
-        #     np.savez("jerry_out/render_data.npz", points=render_pkg2["depth3"].detach().cpu().numpy(), probs=render_pkg2["probs2"].detach().cpu().numpy(), opacity=render_pkg2["opac2"].detach().cpu().numpy(), color=render_pkg2["color2"].detach().cpu().numpy(), gt=all_cams[0].original_image.detach().cpu().numpy())
-        #     print("Wrote data to .npz")
-        #     return
-
-        # if iteration == 2:
-        #     all_cams = scene.getTrainCameras().copy()
-        #     fovxs, fovys, imgs, poses = [], [], [], []
-        #     for cam in all_cams:
-        #         mat = np.zeros((4, 4))
-        #         mat[:3, :3] = viewpoint_cam.R
-        #         mat[:3, 3] = viewpoint_cam.T
-        #         mat[3, 3] = 1.0
-        #         poses.append(mat)
-        #         imgs.append(cam.original_image.cpu().numpy())
-        #         fovxs.append(cam.FoVx)
-        #         fovys.append(cam.FoVy)
-        #
-        #     np.savez("dtu_scan24.npz", fovx=fovxs, fovy=fovys, images=imgs, poses=poses)
-        #     return
-
-        if iteration % 1000 == 2:
+        if iteration % 100 == 0:
             # depth_img = render_pkg["depth2"].detach().cpu().numpy()[0].astype(np.float32)
             mask_img = mask.detach().cpu().numpy()[0].astype(np.float32)
             color_img = image.detach().cpu().numpy().astype(np.float32).clip(0., 1.).transpose(1, 2, 0)
@@ -362,7 +344,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-        if iteration % 2_000 == 0:
+        if iteration % 15_000 == 0:
             print("Draw Means")
             means = gaussians.get_xyz.detach().cpu().numpy()
             colors = gaussians.get_features[:, 0].detach().cpu().numpy()
