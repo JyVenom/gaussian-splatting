@@ -44,7 +44,7 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
-def neus_sigma(xyz, sdf_network, deviation_network):
+def neus_sigma_batched(xyz, sdf_network, deviation_network):
     batch_size = 10_000
     points = xyz.split(batch_size)
 
@@ -59,13 +59,9 @@ def neus_sigma(xyz, sdf_network, deviation_network):
 
         inv_s = deviation_network().expand(batch_size, 1)
         sig = (1 + torch.exp(-inv_s * sdf)).pow(-1)
-        # ldd = (inv_s * torch.exp(-inv_s * sdf)) / ((1 + torch.exp(-inv_s * sdf)).pow(2))
-        ldd = inv_s * sig * (1 - sig)
-        sigma = (ldd / sig / inv_s * 2).reshape(batch_size, 1)
-        # sigma = (1-(torch.exp(-inv_s * sdf)/(1+torch.exp(-inv_s * sdf))))
-        # torch.nan_to_num(sigma)
-        # sigma[sigma.isnan()] = 0.0
-        # sigma = torch.where(torch.isnan(sigma), torch.zeros_like(sigma), sigma)
+        # ldd = inv_s * sig * (1 - sig)
+        # sigma = (ldd / sig / inv_s * 2).reshape(batch_size, 1)
+        sigma = (2 * (1 - sig)).reshape(batch_size, 1)
 
         # Eikonal loss
         gradients = sdf_network.gradient(pts).squeeze()
@@ -77,10 +73,29 @@ def neus_sigma(xyz, sdf_network, deviation_network):
 
         out_psdfs.append(sigma)
 
-        del sdf, sig, ldd, sigma, gradients, gradient_error, pts_norm, relax_inside_sphere
+        # del sdf, sig, sigma, gradients, gradient_error, pts_norm, relax_inside_sphere
 
     sigma = torch.cat(out_psdfs, dim=0)
     gradient_error = a / (b + 1e-5)
+
+    return sigma, gradient_error
+
+def neus_sigma(pts, sdf_network, deviation_network):
+    batch_size = pts.shape[0]
+
+    # pts = pts.requires_grad_(True)
+    sdf = sdf_network.sdf(pts)
+
+    inv_s = deviation_network().expand(batch_size, 1)
+    sig = (1 + torch.exp(-inv_s * sdf)).pow(-1)
+    sigma = (2 * (1 - sig)).reshape(batch_size, 1)
+
+    # Eikonal loss
+    gradients = sdf_network.gradient(pts).squeeze()
+    gradient_error = (torch.linalg.norm(gradients.reshape(batch_size, 3), ord=2, dim=-1) - 1.0) ** 2
+    pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size)
+    relax_inside_sphere = (pts_norm < 1.2).float()
+    gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
 
     return sigma, gradient_error
 
@@ -108,15 +123,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     sdf_network = SDFNetwork(d_out=257, d_in=3, d_hidden=256, n_layers=8, skip_in=[4], multires=6, bias=0.5, scale=1.0, geometric_init=True, weight_norm=True, ).to("cuda")
     deviation_network = SingleVarianceNetwork(init_val=0.55).to("cuda")
-    # sdf_network.eval()
-    # deviation_network.eval()
 
     checkpoint = torch.load(os.path.join(os.path.abspath(""), 'NeuS/checkpoints/ckpt_300000.pth'), map_location="cuda")
     sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
     # deviation_network.load_state_dict(checkpoint['variance_network_fine'])
     neus = True
     if neus:
-        optimizer_neus = torch.optim.Adam([*sdf_network.parameters(), *deviation_network.parameters()])
+        # optimizer_neus = torch.optim.Adam([*sdf_network.parameters(), *deviation_network.parameters()])
+        optimizer_neus = torch.optim.Adam(sdf_network.parameters())
 
     # neus_dataset = Dataset(data_dir="data/dtu/dtu_scan24/", render_cameras_name="cameras_sphere.npz", object_cameras_name="cameras_sphere.npz")
 
@@ -221,7 +235,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                     pass
 
-            if iteration % 10000 == 0:
+            if iteration % 1000 == 0:
                 n, n2 = 256, 64
                 queries = np.concatenate([arr.reshape(-1, 1) for arr in np.meshgrid(*[np.linspace(-1, 1, num=n)] * 3, indexing="ij")], axis=1)
                 occ = np.zeros(0)
@@ -286,8 +300,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not debug_wo_optimize:
             loss.backward()
 
-        # if neus and iteration > 1:
-        #     sigma.backward(gaussians._opacity.grad)
+        if neus and iteration > 1:
+            sigma.backward(gaussians._psdf.grad)
 
         iter_end.record()
 
@@ -335,10 +349,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
-                # if neus and iteration > 1:
-                #     # deviation_network.variance.grad /= gaussians.get_xyz.size(0)
-                #     optimizer_neus.step()
-                #     optimizer_neus.zero_grad(set_to_none=True)
+                if neus and iteration > 1:
+                    # deviation_network.variance.grad /= gaussians.get_xyz.size(0)
+                    optimizer_neus.step()
+                    optimizer_neus.zero_grad(set_to_none=True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

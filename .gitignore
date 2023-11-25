@@ -19,3 +19,4 @@ submodules/
 *.h
 *.cu
 *.zip
+jerry_debug/
