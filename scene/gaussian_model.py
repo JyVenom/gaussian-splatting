@@ -296,6 +296,8 @@ class GaussianModel:
         self.active_sh_degree = self.max_sh_degree
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+        print("Number of points loaded:", xyz.shape[0])
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
