@@ -3,21 +3,21 @@ import open3d as o3d
 
 
 def run():
-    pcd = o3d.io.read_point_cloud("points3D.ply")
+    all_points, all_colors = [], []
+    for view in range(49):
+        pcd = o3d.io.read_point_cloud(f"../jerry_out/all_views_pcds/{view}.ply")
+        pcd, _ = pcd.remove_statistical_outlier(25, 0.5)
+        # o3d.visualization.draw_geometries([pcd])
+        all_points.append(np.asarray(pcd.points))
+        all_colors.append(np.asarray(pcd.colors))
+
+    all_points = np.concatenate(all_points, axis=0)
+    all_colors = np.concatenate(all_colors, axis=0)
+
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(all_points))
+    pcd.colors = o3d.utility.Vector3dVector(all_colors)
+    pcd, _ = pcd.remove_statistical_outlier(50, 1.0)
     o3d.visualization.draw_geometries([pcd])
-
-    labels = np.array(pcd.cluster_dbscan(eps=0.15, min_points=25))
-    unique_labels, label_counts = np.unique(labels[labels >= 0], return_counts=True)
-    most_common_label = unique_labels[np.argmax(label_counts)]
-    mask = (labels == most_common_label)
-
-    points = np.asarray(pcd.points)[mask]
-    colors = np.asarray(pcd.colors)[mask]
-
-    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-    o3d.visualization.draw_geometries([pcd])
-    o3d.io.write_point_cloud("points3D_3.ply", pcd)
 
 
 if __name__ == '__main__':

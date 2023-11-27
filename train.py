@@ -19,8 +19,6 @@ from random import randint
 import numpy as np
 import open3d as o3d
 import torch
-import torch.nn.functional as F
-import trimesh
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
@@ -30,11 +28,7 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim, bce_loss, depth_smoothness_loss, dbscan_loss, dbscan_loss2
-from utils.sh_utils import RGB2SH
 from NeuS.fields import SDFNetwork, SingleVarianceNetwork
-from NeuS.dataset import Dataset
-
-from simple_knn._C import distCUDA2
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -43,68 +37,11 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-
-def neus_sigma_batched(xyz, sdf_network, deviation_network):
-    batch_size = 20_000
-    points = xyz.split(batch_size)
-
-    out_psdfs = []
-    a, b = 0, 0
-
-    for pts in points:
-        batch_size = pts.shape[0]
-
-        sdf = sdf_network.sdf(pts)
-
-        inv_s = deviation_network().expand(batch_size, 1)
-        sig = (1 + torch.exp(-inv_s * sdf)).pow(-1)
-        # ldd = inv_s * sig * (1 - sig)
-        # sigma = (ldd / sig / inv_s * 2).reshape(batch_size, 1)
-        sigma = (2 * (1 - sig)).reshape(batch_size, 1)
-
-        # Eikonal loss
-        gradients = sdf_network.gradient(pts).squeeze()
-        gradient_error = (torch.linalg.norm(gradients.reshape(batch_size, 3), ord=2, dim=-1) - 1.0) ** 2
-        pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size)
-        relax_inside_sphere = (pts_norm < 1.2).float()
-        a += (relax_inside_sphere * gradient_error).sum()
-        b += relax_inside_sphere.sum()
-
-        out_psdfs.append(sigma)
-
-        del sdf, sig, sigma, gradients, gradient_error, pts_norm, relax_inside_sphere
-        torch.cuda.empty_cache()
-
-    sigma = torch.cat(out_psdfs, dim=0)
-    gradient_error = a / (b + 1e-5)
-
-    return sigma, gradient_error
-
-def neus_sigma(pts, sdf_network, deviation_network):
-    batch_size = pts.shape[0]
-
-    # pts = pts.requires_grad_(True)
-    sdf = sdf_network.sdf(pts)
-
-    inv_s = deviation_network().expand(batch_size, 1)
-    sig = (1 + torch.exp(-inv_s * sdf)).pow(-1)
-    sigma = (2 * (1 - sig)).reshape(batch_size, 1)
-
-    # Eikonal loss
-    gradients = sdf_network.gradient(pts).squeeze()
-    gradient_error = (torch.linalg.norm(gradients.reshape(batch_size, 3), ord=2, dim=-1) - 1.0) ** 2
-    pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size)
-    relax_inside_sphere = (pts_norm < 1.2).float()
-    gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
-
-    return sigma, gradient_error
-
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
-    gaussians.load_ply("data/dtu/dtu_scan24/init_3000.ply")
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -121,22 +58,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    sdf_network = SDFNetwork(d_out=257, d_in=3, d_hidden=256, n_layers=8, skip_in=[4], multires=6, bias=0.5, scale=1.0, geometric_init=True, weight_norm=True, ).to("cuda")
-    deviation_network = SingleVarianceNetwork(init_val=0.4).to("cuda")
-
-    checkpoint = torch.load(os.path.join(os.path.abspath(""), 'NeuS/checkpoints/ckpt_010000.pth'), map_location="cuda")
+    sdf_network = SDFNetwork(d_out=257, d_in=3, d_hidden=256, n_layers=8, skip_in=[4], multires=6, bias=0.5, scale=1.0, geometric_init=True, weight_norm=True).to("cuda")
+    checkpoint = torch.load(os.path.join(os.path.abspath(""), 'NeuS/checkpoints/ckpt_300000.pth'), map_location="cuda")
     sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
-    # deviation_network.load_state_dict(checkpoint['variance_network_fine'])
-    neus = True
-    if neus:
-        # optimizer_neus = torch.optim.Adam([*sdf_network.parameters(), *deviation_network.parameters()])
-        optimizer_neus = torch.optim.Adam(sdf_network.parameters(), lr=5e-4)  # from 1e-5
-
-    # neus_dataset = Dataset(data_dir="data/dtu/dtu_scan24/", render_cameras_name="cameras_sphere.npz", object_cameras_name="cameras_sphere.npz")
-
-    # plt.rcParams.update({'font.size': 24})
-
-    debug_wo_optimize = False
 
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -165,99 +89,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
         gt_mask = (viewpoint_cam.depth > 0.01).to(torch.float32)
 
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        if not neus or iteration == 1:
-            if iteration > 1:
-                if debug_wo_optimize:
-                    gaussians._psdf = torch.ones_like(gaussians._psdf)
-                else:
-                    optimizable_tensors = gaussians.replace_tensor_to_optimizer(torch.ones_like(gaussians._psdf), "psdf")
-                    gaussians._psdf = optimizable_tensors["psdf"]
-
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            mask = render_pkg["mask"]
-
-##########################################################################################################################################
-        if neus:
-            if iteration > 1:
-                sigma, eikonal_loss = neus_sigma_batched(gaussians.get_xyz, sdf_network, deviation_network)
-                if debug_wo_optimize:
-                    gaussians._psdf = sigma
-                else:
-                    optimizable_tensors = gaussians.replace_tensor_to_optimizer(sigma, "psdf")
-                    gaussians._psdf = optimizable_tensors["psdf"]
-
-                render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-                image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-                mask = render_pkg["mask"]
-
-                if iteration >= 3000 and iteration % 1000 == 0:
-                    all_cams = scene.getTrainCameras().copy()
-                    all_cams.sort(key=lambda x: int(x.image_name))
-                    viewpoint_cam = all_cams[12]
-                    gt_mask = (viewpoint_cam.depth > 0.01).to(torch.float32)
-                    render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-                    image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-                    mask = render_pkg["mask"]
-
-                    depths3 = render_pkg["depth3"].detach().cpu().numpy()
-                    psdf = render_pkg["psdf2"].detach().cpu().numpy()
-                    opac = render_pkg["opac2"].detach().cpu().numpy()
-                    alpha = render_pkg["alpha2"].detach().cpu().numpy()
-                    pgaus = render_pkg["probs2"].detach().cpu().numpy()
-                    s = deviation_network().item()
-                    sdf = -np.log(psdf / (2 - psdf))/s
-                    weights = alpha * np.cumprod(np.concatenate([np.ones((1, 400, 400)), 1. - alpha + 1e-7], 0), 0)[:-1]
-                    weight_sum = weights.cumsum(axis=0)
-
-                    print("View #", viewpoint_cam.image_name)
-
-                    # rays = np.concatenate([arr.reshape(-1, 1) for arr in np.meshgrid(*[np.arange(196, 205, 2)] * 2, indexing="ij")], axis=1).astype(int)
-                    # for ray_num in rays:
-                    ray_num = (200, 200)
-                    num = depths3[:, ray_num[0], ray_num[1]].argmin()
-                    if num == 0 and depths3[0, ray_num[0], ray_num[1]] != 0:
-                        num = depths3.shape[0]
-                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], opac[:num, ray_num[0], ray_num[1]], color='red')
-                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], alpha[:num, ray_num[0], ray_num[1]], 'b*')
-                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], psdf[:num, ray_num[0], ray_num[1]], color='green')
-                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], pgaus[:num, ray_num[0], ray_num[1]], color='orange')
-                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], sdf[:num, ray_num[0], ray_num[1]] * 10, color='violet')
-                    plt.plot(depths3[:num, ray_num[0], ray_num[1]], weight_sum[:num, ray_num[0], ray_num[1]], color='indigo')
-                    plt.legend(["opac", "alpha", "psdf (normalised eq, /=s)", "pgaus", "sdf x10", "weight sum"])
-                    plt.show()
-
-                    pass
-
-            if iteration > 3000 and iteration % 1000 == 0:
-                n, n2 = 256, 64
-                queries = np.concatenate([arr.reshape(-1, 1) for arr in np.meshgrid(*[np.linspace(-1, 1, num=n)] * 3, indexing="ij")], axis=1)
-                occ = np.zeros(0)
-                for i in range(0, n**3, n2**3):
-                    occ_batch = -sdf_network.sdf(torch.tensor(queries[i:i+n2**3], device='cuda').to(torch.float32)).detach().cpu().numpy()
-                    occ = np.concatenate((occ, occ_batch.squeeze()), axis=0)
-                occ = occ.reshape(n, n, n)
-                # occ = -sdf_network.sdf(torch.tensor(queries, device='cuda').to(torch.float32)).detach().cpu().numpy().reshape(n, n, n)
-                import mcubes
-                vertices, triangles = mcubes.marching_cubes(occ, 0.0)
-                vertices = vertices / (n - 1) * 2 - 1
-                mesh = trimesh.Trimesh(vertices, triangles)
-                mesh.show()
-##########################################################################################################################################
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        mask = render_pkg["mask"]
 
         if iteration % 100 == 0:
-            # depth_img = render_pkg["depth2"].detach().cpu().numpy()[0].astype(np.float32)
+            depth_img = render_pkg["depth"].detach().cpu().numpy()[0].astype(np.float32)
             mask_img = mask.detach().cpu().numpy()[0].astype(np.float32)
             color_img = image.detach().cpu().numpy().astype(np.float32).clip(0., 1.).transpose(1, 2, 0)
-            # color_img = image.T.reshape(100, 100, 3).detach().cpu().numpy().astype(np.float32).clip(0., 1.)
-            # depth_gt = (viewpoint_cam.depth.detach().cpu().numpy()).astype(np.float32)
+            depth_gt = (viewpoint_cam.depth.detach().cpu().numpy()).astype(np.float32)
             mask_gt = gt_mask.detach().cpu().numpy().astype(np.float32)
             color_gt = viewpoint_cam.original_image.detach().cpu().numpy().astype(np.float32).transpose(1, 2, 0)
 
@@ -265,19 +111,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # plt.imsave("jerry_out/est_mask.png", mask_img, cmap='gray')
             plt.imsave("jerry_out/est_color.png", color_img)
 
-            fig, axs = plt.subplots(2, 2, figsize=(10, 12))
-            axs[0, 0].imshow(mask_gt, cmap='gray')
-            axs[0, 0].set_title('GT Mask')
+            fig, axs = plt.subplots(3, 2, figsize=(10, 17))
+            axs[0, 0].imshow(depth_gt, cmap='gray')
+            axs[0, 0].set_title('GT Depth')
             axs[0, 0].axis('off')
-            axs[0, 1].imshow(mask_img, cmap='gray')
-            axs[0, 1].set_title('Estimated Mask')
+            axs[0, 1].imshow(depth_img, cmap='gray')
+            axs[0, 1].set_title('Estimated Depth')
             axs[0, 1].axis('off')
-            axs[1, 0].imshow(color_gt)
-            axs[1, 0].set_title('GT Color')
+            axs[1, 0].imshow(mask_gt, cmap='gray')
+            axs[1, 0].set_title('GT Mask')
             axs[1, 0].axis('off')
-            axs[1, 1].imshow(color_img)
-            axs[1, 1].set_title('Estimated Color')
+            axs[1, 1].imshow(mask_img, cmap='gray')
+            axs[1, 1].set_title('Estimated Mask')
             axs[1, 1].axis('off')
+            axs[2, 0].imshow(color_gt)
+            axs[2, 0].set_title('GT Color')
+            axs[2, 0].axis('off')
+            axs[2, 1].imshow(color_img)
+            axs[2, 1].set_title('Estimated Color')
+            axs[2, 1].axis('off')
             plt.tight_layout()
             plt.show()
 
@@ -290,24 +142,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         mask_loss = bce_loss(mask.squeeze(), gt_mask)
         beta_1 = 0.1
         loss = 1 * loss + beta_1 * mask_loss
-        if neus and iteration > 3000:
-            loss = loss + eikonal_loss * 0.1
+        loss.backward()
+
+        iter_end.record()
 
         if iteration % 100 == 0:
             print("Loss:", loss)
-            print("S:", deviation_network().clip(1e-6, 1e6))
             print("# Gaussians:", gaussians.get_xyz.shape[0])
-
-        if not debug_wo_optimize:
-            loss.backward()
-
-        if neus and iteration > 1:
-            sigma.backward(gaussians._psdf.grad)
-
-        if iteration % 100 == 0:
-            print("SDF lin0 bias grad abs mean:", sdf_network.lin0.bias.grad.abs().mean())
-
-        iter_end.record()
 
         with torch.no_grad():
             # Progress bar
@@ -320,80 +161,67 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if (iteration in saving_iterations):
+            if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
-                if not debug_wo_optimize:
-                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, radii)
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, radii)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and not debug_wo_optimize:
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)  # gaussians.optimizer.zero_grad(set_to_none=True)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
 
-                if iteration > 1000 and iteration % 100 == 0:
-                    # Clustering
-                    means = gaussians.get_xyz.detach().cpu().numpy()
-                    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means))
+                if iteration > 1000 and iteration % opt.densification_interval == 0:
+                    sdf = sdf_network.sdf(gaussians.get_xyz).squeeze()
+                    gaussians.prune_points(sdf.abs() > 0.036)
 
+                if iteration > 1000 and iteration % opt.densification_interval == 0:
+                    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(gaussians.get_xyz.detach().cpu().numpy()))
                     labels = np.array(pcd.cluster_dbscan(eps=0.1, min_points=25))
                     unique_labels, label_counts = np.unique(labels[labels >= 0], return_counts=True)
                     most_common_label = unique_labels[np.argmax(label_counts)]
                     gaussians.prune_points(labels != most_common_label)
                     # print(f"DBSCAN Pruned {(labels != most_common_label).sum().item()} Gaussians")
 
-                # if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                #     gaussians.reset_opacity()
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
 
             # Optimizer step
-            if (iteration < opt.iterations and not debug_wo_optimize) or iteration == 1:
-                if iteration <= 3000:
-                    gaussians.optimizer.step()
+            if iteration < opt.iterations:
+                gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
-
-                if neus:
-                    if iteration > 3000:
-                        optimizer_neus.step()
-                    optimizer_neus.zero_grad(set_to_none=True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+        # if iteration % 15_000 == 0:
+        #     print("Draw Means")
+        #     means = gaussians.get_xyz.detach().cpu().numpy()
+        #     colors = gaussians.get_features[:, 0].detach().cpu().numpy()
+        #     pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means))
+        #     pcd.colors = o3d.utility.Vector3dVector(o3d.utility.Vector3dVector(colors))
+        #     o3d.visualization.draw_geometries([pcd])
+
         if iteration % 15_000 == 0:
-            print("Draw Means")
-            means = gaussians.get_xyz.detach().cpu().numpy()
-            colors = gaussians.get_features[:, 0].detach().cpu().numpy()
-            pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means))
-            pcd.colors = o3d.utility.Vector3dVector(o3d.utility.Vector3dVector(colors))
-            o3d.visualization.draw_geometries([pcd])
-
-        if iteration % 150_000 == 0:
             print("Begin Depth to PCD to Mesh")
-
-            # gaussians.extract_mesh(resolution=256)
 
             def depth_image_to_point_cloud(depth_image, color_image, intrinsic_matrix, R, T):
                 fx, fy, cx, cy = intrinsic_matrix
                 height, width = depth_image.shape
 
-                pcd, colors = [], []
-                for i in range(height):
-                    for j in range(width):
-                        z = depth_image[i][j]
-                        if z > 0:
-                            x = (j - cx) * z / fx
-                            y = (i - cy) * z / fy
-                            pcd.append([x, y, z])
-                            colors.append(color_image[i][j])
+                rows, cols = torch.tensor(range(height), device='cuda').unsqueeze(-1).expand(height, width), torch.tensor(range(width), device='cuda').expand(height, width)
 
-                pcd = np.array(pcd)
-                pcd = np.matmul(pcd, R) + T
+                zs = depth_image
+                xs = (cols - cx) * zs / fx
+                ys = (rows - cy) * zs / fy
+                mask = zs > 0
+                pcd2 = torch.cat((xs[mask].unsqueeze(-1), ys[mask].unsqueeze(-1), zs[mask].unsqueeze(-1)), dim=-1)
 
-                return pcd, np.array(colors)
+                return np.matmul(pcd2.detach().cpu().numpy(), R) + T, color_image[mask]
 
             def fov2focal(fov, pixels):
                 return pixels / (2 * math.tan(fov / 2))
@@ -402,16 +230,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             points = np.empty((0, 3))
             colors = np.empty((0, 3))
-            normals = np.empty((0, 3))
+            # normals = np.empty((0, 3))
             all_cams = scene.getTrainCameras().copy()
             for viewpoint_cam in tqdm(all_cams, desc="PCD Creation Progress", leave=False):
                 # Get data
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-                color = render_pkg["render"].permute(1, 2, 0).detach().cpu().numpy()
-                depth = render_pkg["depth2"]
+                color = render_pkg["render"].permute(1, 2, 0)
+                depth = render_pkg["depth"]
                 remove_mask = render_pkg["mask"] < 0.95
                 depth[remove_mask] = 0
-                depth = depth.squeeze(0).detach().cpu().numpy()
+                depth = depth.squeeze(0)
 
                 # Get camera extrinsics
                 mat = np.zeros((4, 4))
@@ -425,38 +253,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 p, c = depth_image_to_point_cloud(depth, color, intrinsic_matrix, mat[:3, :3], mat[:3, 3])
                 pcd = o3d.geometry.PointCloud()
                 pcd.points = o3d.utility.Vector3dVector(p)
-                pcd.colors = o3d.utility.Vector3dVector(c)
-                pcd, removed = pcd.remove_statistical_outlier(25, 1.0)
+                pcd.colors = o3d.utility.Vector3dVector(c.detach().cpu().numpy())
+                o3d.io.write_point_cloud(f"jerry_out/all_views_pcds/{int(viewpoint_cam.image_name)}.ply", pcd)
+                pcd, _ = pcd.remove_statistical_outlier(25, 0.5)
 
-                # Correct normals (angle between normal and vector towards camera should be < 90 deg)
-                pcd.estimate_normals()
-                norms = np.asarray(pcd.normals)
-                points_np = np.asarray(pcd.points)
-                c_vecs = mat[:3, 3] - points_np
-                c_mags = np.linalg.norm(c_vecs, axis=1)
-                n_mags = np.linalg.norm(norms, axis=1)
-                angles = np.degrees(np.arccos((c_vecs * norms).sum(axis=1) / (c_mags * n_mags)))
-                norms[angles > 90] *= (-1)
+                # # Correct normals (angle between normal and vector towards camera should be < 90 deg)
+                # pcd.estimate_normals()
+                # norms = np.asarray(pcd.normals)
+                # points_np = np.asarray(pcd.points)
+                # c_vecs = mat[:3, 3] - points_np
+                # c_mags = np.linalg.norm(c_vecs, axis=1)
+                # n_mags = np.linalg.norm(norms, axis=1)
+                # angles = np.degrees(np.arccos((c_vecs * norms).sum(axis=1) / (c_mags * n_mags)))
+                # norms[angles > 90] *= (-1)
 
                 # Save data
-                points = np.concatenate((points, points_np), axis=0)
-                normals = np.concatenate((normals, norms), axis=0)
+                points = np.concatenate((points, np.asarray(pcd.points)), axis=0)
+                # normals = np.concatenate((normals, norms), axis=0)
                 colors = np.concatenate((colors, np.asarray(pcd.colors)), axis=0)
 
             # Display pcd
             pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-            pcd.normals = o3d.utility.Vector3dVector(normals)
+            # pcd.normals = o3d.utility.Vector3dVector(normals)
             pcd.colors = o3d.utility.Vector3dVector(colors)
-            pcd, _ = pcd.remove_statistical_outlier(100, 1.25)
+            o3d.visualization.draw_geometries([pcd])
+            pcd, _ = pcd.remove_statistical_outlier(50, 1.0)
             o3d.visualization.draw_geometries([pcd])
             o3d.io.write_point_cloud("jerry_out/pcd.ply", pcd)
 
-            # To mesh (SPSR)
-            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
-            mesh.compute_vertex_normals()
-            # mesh = mesh.filter_smooth_simple(number_of_iterations=3)
-            o3d.visualization.draw_geometries([mesh])
-            o3d.io.write_triangle_mesh("jerry_out/spsr_mesh.ply", mesh)
+            # # To mesh (SPSR)
+            # mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
+            # mesh.compute_vertex_normals()
+            # # mesh = mesh.filter_smooth_simple(number_of_iterations=3)
+            # o3d.visualization.draw_geometries([mesh])
+            # o3d.io.write_triangle_mesh("jerry_out/spsr_mesh.ply", mesh)
 
     print("Final # of gaussians:", gaussians._xyz.size(0))
 
