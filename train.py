@@ -99,6 +99,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         mask = render_pkg["mask"]
 
+        if iteration == 10_000:
+            all_cams = scene.getTrainCameras().copy()
+            all_cams.sort(key=lambda x: int(x.image_name))
+            all_depths = []
+            for viewpoint_cam in all_cams:
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+                all_depths.append(render_pkg["depth2"].detach().cpu().numpy())
+            all_depths = np.stack(all_depths)
+            np.savez("all_poses_gaussian_depths_pruned.npz", all_depths=all_depths)
+            print("Saved all views pruned gaussian depths")
+
         if iteration % 100 == 0:
             depth_img = render_pkg["depth"].detach().cpu().numpy()[0].astype(np.float32)
             mask_img = mask.detach().cpu().numpy()[0].astype(np.float32)
