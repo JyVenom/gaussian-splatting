@@ -29,12 +29,8 @@ from gaussian_renderer import render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
-from utils.loss_utils import l1_loss, ssim, bce_loss, depth_smoothness_loss, dbscan_loss, dbscan_loss2
-from utils.sh_utils import RGB2SH
+from utils.loss_utils import l1_loss, ssim, bce_loss
 from NeuS.fields import SDFNetwork, SingleVarianceNetwork
-from NeuS.dataset import Dataset
-
-from simple_knn._C import distCUDA2
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -101,7 +97,6 @@ def neus_sigma(pts, sdf_network, deviation_network):
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.load_ply("data/dtu/dtu_scan24/init_3000.ply")
@@ -122,17 +117,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
 
     sdf_network = SDFNetwork(d_out=257, d_in=3, d_hidden=256, n_layers=8, skip_in=[4], multires=6, bias=0.5, scale=1.0, geometric_init=True, weight_norm=True, ).to("cuda")
-    deviation_network = SingleVarianceNetwork(init_val=0.4).to("cuda")
+    deviation_network = SingleVarianceNetwork(init_val=0.5).to("cuda")
 
     checkpoint = torch.load(os.path.join(os.path.abspath(""), 'NeuS/checkpoints/ckpt_010000.pth'), map_location="cuda")
     sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
-    # deviation_network.load_state_dict(checkpoint['variance_network_fine'])
     neus = True
     if neus:
         # optimizer_neus = torch.optim.Adam([*sdf_network.parameters(), *deviation_network.parameters()])
         optimizer_neus = torch.optim.Adam(sdf_network.parameters(), lr=5e-4)  # from 1e-5
-
-    # neus_dataset = Dataset(data_dir="data/dtu/dtu_scan24/", render_cameras_name="cameras_sphere.npz", object_cameras_name="cameras_sphere.npz")
 
     # plt.rcParams.update({'font.size': 24})
 
