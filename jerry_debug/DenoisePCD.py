@@ -6,7 +6,7 @@ def run():
     all_points, all_colors = [], []
     for view in range(49):
         pcd = o3d.io.read_point_cloud(f"../jerry_out/all_views_pcds/{view}.ply")
-        pcd, _ = pcd.remove_statistical_outlier(25, 0.5)
+        pcd, _ = pcd.remove_statistical_outlier(25, 2.0)
         # o3d.visualization.draw_geometries([pcd])
         all_points.append(np.asarray(pcd.points))
         all_colors.append(np.asarray(pcd.colors))
@@ -16,7 +16,8 @@ def run():
 
     pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(all_points))
     pcd.colors = o3d.utility.Vector3dVector(all_colors)
-    pcd, _ = pcd.remove_statistical_outlier(50, 1.0)
+    o3d.visualization.draw_geometries([pcd])
+    pcd, _ = pcd.remove_statistical_outlier(50, 2.0)
     o3d.visualization.draw_geometries([pcd])
 
 

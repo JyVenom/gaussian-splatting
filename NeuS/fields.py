@@ -50,7 +50,7 @@ class SDFNetwork(nn.Module):
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
 
             if weight_norm:
-                lin = nn.utils.weight_norm(lin)
+                lin = nn.utils.parametrizations.weight_norm(lin)
 
             setattr(self, "lin" + str(l), lin)
 
