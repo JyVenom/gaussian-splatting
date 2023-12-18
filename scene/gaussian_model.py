@@ -11,8 +11,10 @@
 
 import torch
 import numpy as np
+
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+import torch.nn.functional as F
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -124,6 +126,16 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    def vectors_to_quaternions(self, vectors):
+        vectors = F.normalize(vectors, p=2, dim=-1)
+
+        z_axis = torch.tensor([0.0, 0.0, 1.0], device='cuda').expand(vectors.shape)
+        axis = torch.cross(z_axis, vectors)
+        axis = F.normalize(axis, p=2, dim=-1)
+        angle = torch.acos(torch.bmm(z_axis.view(-1, 1, 3), vectors.view(-1, 3, 1)).squeeze())
+
+        return torch.cat([torch.cos(angle / 2).unsqueeze(-1), axis * torch.sin(angle / 2).unsqueeze(-1)], dim=-1)
+
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -136,8 +148,12 @@ class GaussianModel:
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
-        rots[:, 0] = 1
+        # rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        # rots[:, 0] = 1
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(fused_point_cloud.cpu().numpy()))
+        pcd.estimate_normals()
+        pcd.orient_normals_consistent_tangent_plane(15)
+        rots = self.vectors_to_quaternions(torch.tensor(np.asarray(pcd.normals), device='cuda').float() * (-1))
 
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
         # opacities = 0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
