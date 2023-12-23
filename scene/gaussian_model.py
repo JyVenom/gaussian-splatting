@@ -153,7 +153,7 @@ class GaussianModel:
         pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(fused_point_cloud.cpu().numpy()))
         pcd.estimate_normals()
         pcd.orient_normals_consistent_tangent_plane(15)
-        rots = self.vectors_to_quaternions(torch.tensor(np.asarray(pcd.normals), device='cuda').float() * (-1))
+        rots = self.vectors_to_quaternions(torch.tensor(np.asarray(pcd.normals), device='cuda').float() * (-1))  # -1 is hardcoded reversal. improvement is to check each camera pose. reverse all visible gaussian as necessary to point to camera
 
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
         # opacities = 0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
@@ -450,3 +450,8 @@ class GaussianModel:
 
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def remove_small(self):
+        gaus_area = self.get_scaling.argsort()
+        gaus_area = (self.get_scaling.gather(1, gaus_area[:, 1].view(-1, 1)) * self.get_scaling.gather(1, gaus_area[:, 0].view(-1, 1))).view(-1) < 1e-6  # (2/400)**2
+        self.prune_points(gaus_area)

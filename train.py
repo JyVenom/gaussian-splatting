@@ -44,44 +44,6 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
-def fit_plane(points):
-    # Center the points by subtracting the mean
-    centered_points = points - points.mean(dim=0)
-
-    # Apply SVD
-    _, _, v = torch.svd(centered_points)
-
-    # The normal vector is the last column of V
-    normal_vector = v[:, -1]
-
-    # Ensure the normal vector is pointing outward (towards the mean of the points)
-    if normal_vector[2] < 0:
-        normal_vector = -normal_vector
-
-    return normal_vector
-
-def fit_plane_pca(points):
-    # Step 1: Find the centroid of the points
-    centroid = torch.mean(points, dim=0)
-
-    # Step 2: Subtract the centroid from the points to center them around origin
-    points_centered = points - centroid
-
-    # Step 3: Compute the covariance matrix
-    covariance_matrix = points_centered.t().mm(points_centered) / points_centered.size(0)
-
-    # Step 4: Perform SVD (Singular Value Decomposition) on the covariance matrix
-    u, s, v = torch.svd(covariance_matrix)
-
-    # The normal of the plane is the eigenvector associated with the smallest eigenvalue, which is the last column of v
-    normal = v[:, -1]
-
-    # Ensure the normal vector is pointing outward (towards the mean of the points)
-    if normal[2] < 0:
-        normal = -normal
-
-    return normal
-
 def quat2mat(q):
     r, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
 
@@ -123,7 +85,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     checkpoint = torch.load(os.path.join(os.path.abspath(""), 'NeuS/checkpoints/ckpt_300000.pth'), map_location="cuda")
     sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
     sdf_network.eval()
-    # neus_optim = torch.optim.Adam(sdf_network.parameters(), lr=1e-3)
+    neus_optim = torch.optim.Adam(sdf_network.parameters(), lr=1e-3)
 
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -145,7 +107,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
+        # Every 1000 iters we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
@@ -162,23 +124,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         depth, mask = render_pkg["depth"], render_pkg["mask"]
 
-        # if iteration == 2:
-        #     import torch.nn.functional as F
-        #     def vectors_to_quaternions(vectors):
-        #         vectors = F.normalize(vectors, p=2, dim=-1)
-        #
-        #         z_axis = torch.tensor([0.0, 0.0, 1.0], device='cuda').expand(vectors.shape)
-        #         axis = torch.cross(z_axis, vectors)
-        #         axis = F.normalize(axis, p=2, dim=-1)
-        #         angle = torch.acos(torch.bmm(z_axis.view(-1, 1, 3), vectors.view(-1, 3, 1)).squeeze())
-        #
-        #         return torch.cat([torch.cos(angle / 2).unsqueeze(-1), axis * torch.sin(angle / 2).unsqueeze(-1)], dim=-1)
-        #
-        #     rots_new = vectors_to_quaternions(sdf_network.gradient(gaussians.get_xyz.detach()).squeeze())
-        #     optimizable_tensors = gaussians.replace_tensor_to_optimizer(rots_new, "rotation")
-        #     gaussians._rotation = optimizable_tensors["rotation"]
-
-        if iteration % 100 == 0:
+        if iteration % 500 == 0:
             depth_img = depth.detach().cpu().numpy()[0].astype(np.float32)
             mask_img = mask.detach().cpu().numpy()[0].astype(np.float32)
             color_img = image.detach().cpu().numpy().astype(np.float32).clip(0., 1.).transpose(1, 2, 0)
@@ -220,31 +166,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         color_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss = 0
         loss += color_loss
-        # if iteration > 1500:
-        #     normals = torch.zeros_like(gaussians.get_xyz).cuda()
-        #     normals[:, 2] = 1
-        #     normals.requires_grad_(True)
-        #     rot_mats = quat2mat(gaussians.get_rotation)
-        #     gaus_norms = torch.einsum('ijk,ik->ij', rot_mats, normals)
-        #
-        #     idx = torch.randint(gaussians.get_xyz.shape[0], (1,))
-        #     point = gaussians.get_xyz[idx]
-        #     dists = torch.sum((gaussians.get_xyz - point) ** 2, dim=1)
-        #     indices = torch.argsort(dists)[:25]
-        #     plane_normal = fit_plane(gaussians.get_xyz[indices])
-        #     centroid = gaussians.get_xyz[indices].mean(axis=0)
-        #     mat = torch.eye(4, device='cuda')
-        #     mat[:3, :3] = torch.tensor(viewpoint_cam.R.transpose(), device='cuda')
-        #     mat[:3, 3] = torch.tensor(viewpoint_cam.T, device='cuda')
-        #     mat = torch.linalg.inv(mat)
-        #     c_vec = mat[:3, 3] - centroid
-        #     c_mag = torch.linalg.norm(c_vec)
-        #     n_mag = torch.linalg.norm(plane_normal)
-        #     angle = torch.rad2deg(torch.arccos((c_vec * plane_normal).sum() / (c_mag * n_mag)))
-        #     if angle > 90:
-        #         plane_normal = -plane_normal
-        #     norms_loss = torch.nn.functional.cosine_embedding_loss(gaus_norms[indices], plane_normal.unsqueeze(0), torch.ones(indices.shape[0]).cuda())
-        #     loss += norms_loss
         if iteration > 1500:
             normals = torch.zeros_like(gaussians.get_xyz).cuda()
             normals[:, 2] = 1
@@ -252,16 +173,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             rot_mats = quat2mat(gaussians.get_rotation)
             gaus_norms = torch.einsum('ijk,ik->ij', rot_mats, normals)
 
+            idx = torch.randint(gaussians.get_xyz.shape[0], (1,))
+            point = gaussians.get_xyz[idx].detach()
+            dists = torch.sum((gaussians.get_xyz.detach()-point)**2, dim=1)
+            indices = torch.topk(dists, 1000, largest=False).indices
+            nearest = gaussians.get_xyz[indices].detach()
+            nearest_np = nearest.cpu().numpy()
+
             mat = torch.eye(4, device='cuda')
             mat[:3, :3] = torch.tensor(viewpoint_cam.R.transpose(), device='cuda')
             mat[:3, 3] = torch.tensor(viewpoint_cam.T, device='cuda')
             mat = torch.linalg.inv(mat)
-
-            idx = torch.randint(gaussians.get_xyz.shape[0], (1,))
-            point = gaussians.get_xyz[idx].detach()
-            dists = torch.sum((gaussians.get_xyz.detach()-point)**2, dim=1)
-            _, indices = torch.topk(dists, 1000, largest=False)
-            nearest_np = gaussians.get_xyz[indices].detach().cpu().numpy()
 
             c_vecs = mat[:3, 3] - gaussians.get_xyz[indices]
             c_mags = torch.linalg.norm(c_vecs, axis=1)
@@ -271,7 +193,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(nearest_np))
             pcd.normals = o3d.utility.Vector3dVector(gaus_norms[indices].detach().cpu().numpy())
-            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
+            mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
 
             rc_scene = o3d.t.geometry.RaycastingScene()
             rc_scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
@@ -280,40 +202,61 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             spsr_loss = torch.nn.functional.l1_loss(gaussians.get_xyz[indices], closest_points) * 1000
             loss += spsr_loss
 
-            spsr_points = np.asarray(mesh.vertices)
-            tree = KDTree(spsr_points)
-            closest_indices = tree.query(nearest_np, k=1, return_distance=False).squeeze()
-            spsr_norms = torch.tensor(np.asarray(mesh.vertex_normals)[closest_indices], device='cuda')
+            # spsr_points = torch.tensor(np.asarray(mesh.vertices), device='cuda').float()
+            # dists = ((nearest.unsqueeze(1)-spsr_points)**2).sum(dim=-1)
+            # # dists = torch.cdist(nearest, spsr_points, 2)
+            # closest_indices = torch.topk(dists, 1, largest=False, dim=1).indices
+            spsr_points = np.asarray(mesh.vertices, dtype=np.float32)
+            closest_indices = KDTree(spsr_points).query(nearest_np, k=1, return_distance=False).squeeze()
+            spsr_norms = torch.tensor(np.asarray(mesh.vertex_normals)[closest_indices], device='cuda', dtype=torch.float32).squeeze()
             norms_loss = torch.nn.functional.cosine_embedding_loss(gaus_norms[indices], spsr_norms, torch.ones(indices.shape[0]).cuda())
             loss += norms_loss
 
+            target_opac = gaussians.get_opacity.round()
+            opacity_loss = torch.nn.functional.binary_cross_entropy(gaussians.get_opacity, target_opac)  #, weight=((1-torch.sigmoid(gaussians.get_opacity.detach()*3))*0.05))
+            loss += opacity_loss
+
+            ray_alphas = render_pkg["ray_alphas"].permute(1, 2, 0)
+            ray_depths = render_pkg["ray_depths"].permute(1, 2, 0)
+            ray_depths = torch.cat([ray_depths, torch.zeros((400, 400, 1), device='cuda')], -1)
+            ray_depths[ray_depths==0] = 100
+            delta = ray_depths[..., 1:] - ray_depths[..., :-1]
+            end_first_wall = (delta>0.05).to(int).argmax(dim=-1)-1
+            mask1 = end_first_wall<0  # or ==-1
+            end_first_wall[mask1]=0
+            ray_T = torch.cumprod(1 - ray_alphas, -1)[..., :-1]
+            overlap_loss = torch.gather(torch.cumsum(1/ray_T, -1), -1, end_first_wall.unsqueeze(-1))[~mask1].mean()/1000
+            loss += overlap_loss
         loss.backward()
 
         iter_end.record()
 
         if iteration % 1000 == 0:
             normals = torch.zeros_like(gaussians.get_xyz.detach().cpu()).cuda()
-            # mask = gaussians.get_scaling.argmin(dim=1)
-            # normals[torch.arange(mask.shape[0]), mask] = 1
             normals[:, 2] = 1
             rot_mats = quat2mat(gaussians.get_rotation.detach().cpu())
             gaus_norms = torch.einsum('ijk,ik->ij', rot_mats, normals).detach().cpu().numpy()
 
             from scipy.io import savemat
-            savemat("gaussian_data_12_10.mat", {"means": gaussians.get_xyz.detach().cpu().numpy(), "scaling": gaussians.get_scaling.detach().cpu().numpy(), "rotation": gaussians.get_rotation.detach().cpu().numpy(), "opacity": gaussians.get_opacity.detach().cpu().numpy(), "sdf": sdf_network.sdf(gaussians.get_xyz.detach()).detach().cpu().numpy(), "normals": gaus_norms})
+            savemat("gaussian_data_12_17.mat", {"means": gaussians.get_xyz.detach().cpu().numpy(), "scaling": gaussians.get_scaling.detach().cpu().numpy(), "rotation": gaussians.get_rotation.detach().cpu().numpy(), "opacity": gaussians.get_opacity.detach().cpu().numpy(), "sdf": sdf_network.sdf(gaussians.get_xyz.detach()).detach().cpu().numpy(), "normals": gaus_norms})
+            np.savez("gaussian_data_12_17.npz", means=gaussians.get_xyz.detach().cpu().numpy(), scaling=gaussians.get_scaling.detach().cpu().numpy(), rotation=gaussians.get_rotation.detach().cpu().numpy(), opacity=gaussians.get_opacity.detach().cpu().numpy(), sdf=sdf_network.sdf(gaussians.get_xyz.detach()).detach().cpu().numpy(), normals=gaus_norms)
 
             sdf = sdf_network.sdf(gaussians.get_xyz.detach()).detach().cpu().numpy()
             plt.hist(sdf, bins=np.linspace(sdf.min(), sdf.max(), 1000))
             std = np.sqrt(((sdf-sdf.mean())**2).mean())
-            plt.title(f"STD: {std}")
+            plt.title(f"SDFs (std={std})")
+            plt.show()
+
+            plt.hist(gaussians.get_opacity.squeeze().detach().cpu().numpy(), bins=np.linspace(0, 1, 100))
+            plt.title("Opacities")
             plt.show()
 
         if iteration % 500 == 0:
             print("\nColor Loss:", color_loss)
             print("# Gaussians:", gaussians.get_xyz.shape[0])
             sdf = sdf_network.sdf(gaussians.get_xyz.detach()).squeeze()
-            sdf = sdf[~sdf.isnan()].abs()
-            print("Avg SDF", sdf.mean().item())
+            udf = sdf[~sdf.isnan()].abs()
+            print("Avg SDF", udf.mean().item())
 
         with torch.no_grad():
             # Progress bar
@@ -336,10 +279,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.5/1000*(iteration-500) if iteration < 1500 else 0.5, scene.cameras_extent, size_threshold)
 
-                # if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                #     gaussians.reset_opacity()
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
+
+                if iteration > 1500 and iteration % opt.densification_interval == 0:
+                    gaussians.remove_small()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -354,26 +300,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians._scaling = optimizable_tensors["scaling"]
 
                 if iteration > 1000:
-                    # Don't let opacity go below 0.7
-                    opacities_new = gaussians.inverse_opacity_activation(torch.max(gaussians.get_opacity, torch.ones_like(gaussians.get_opacity) * 0.7))
-                    optimizable_tensors = gaussians.replace_tensor_to_optimizer(opacities_new, "opacity")
-                    gaussians._opacity = optimizable_tensors["opacity"]
+                    # # Don't let opacity go below 0.7
+                    # opacities_new = gaussians.inverse_opacity_activation(torch.max(gaussians.get_opacity, torch.ones_like(gaussians.get_opacity) * 0.7))
+                    # optimizable_tensors = gaussians.replace_tensor_to_optimizer(opacities_new, "opacity")
+                    # gaussians._opacity = optimizable_tensors["opacity"]
 
                     # Don't let scaling go above 0.02
                     scales_new = gaussians.scaling_inverse_activation(torch.min(gaussians.get_scaling, torch.ones_like(gaussians.get_scaling) * 0.02))
                     optimizable_tensors = gaussians.replace_tensor_to_optimizer(scales_new, "scaling")
                     gaussians._scaling = optimizable_tensors["scaling"]
 
-                # neus_optim.zero_grad()
+                neus_optim.zero_grad()
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-        if iteration % 2_000 == 1:
+        if iteration % 2_000 == 0:
             print("Draw Means")
             means = gaussians.get_xyz.detach().cpu().numpy()
             colors = SH2RGB(gaussians.get_features[:, 0].detach().cpu().numpy())
+            opacities = gaussians.get_opacity.detach().cpu().numpy()
 
             normals = np.zeros_like(means)
             normals[:, 2] = 1
@@ -381,7 +328,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             normals = np.einsum('ijk,ik->ij', rot_mats, normals)
 
             pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means))
-            pcd.colors = o3d.utility.Vector3dVector(colors)
+            pcd.colors = o3d.utility.Vector3dVector(colors*opacities)
             pcd.normals = o3d.utility.Vector3dVector(normals)
 
             o3d.visualization.draw_geometries([pcd])
